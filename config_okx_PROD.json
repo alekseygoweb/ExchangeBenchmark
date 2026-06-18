@@ -9,6 +9,7 @@
 
     "auto_price": false,
     "price_offset_pct": 1.0,
+    "auto_size": false,
 
     "futures": {
         "inst_id": "BTC-USDT-SWAP",

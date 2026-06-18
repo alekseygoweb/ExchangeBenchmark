@@ -153,7 +153,11 @@ class BinanceRest:
         self.key = cfg["api_key"]
         self.secret = cfg["api_secret"].encode()
         self.timeout = cfg.get("timeout_sec", 10)
-        self.path = "/fapi/v1/order" if market == "futures" else "/api/v3/order"
+        self.market = market
+        self.is_futures = market == "futures"
+        self.symbol = cfg["symbol"]
+        self.path = "/fapi/v1/order" if self.is_futures else "/api/v3/order"
+        self.open_path = "/fapi/v1/openOrders" if self.is_futures else "/api/v3/openOrders"
         self.session = requests.Session()
         self.session.headers.update({"X-MBX-APIKEY": self.key})
 
@@ -163,10 +167,13 @@ class BinanceRest:
         return query + "&signature=" + sig
 
     def _signed(self, method, params):
+        return self._signed_path(method, self.path, params)
+
+    def _signed_path(self, method, path, params):
         params = dict(params)
         params["timestamp"] = now_ms()
         params["recvWindow"] = self.cfg.get("recv_window", 5000)
-        url = f"{self.base}{self.path}?{self._sign(params)}"
+        url = f"{self.base}{path}?{self._sign(params)}"
         r = self.session.request(method, url, timeout=self.timeout)
         data = r.json()
         if r.status_code != 200:
@@ -193,6 +200,31 @@ class BinanceRest:
         if data.get("status") != "CANCELED":
             raise RuntimeError(f"ордер не отменён: {data}")
 
+    def list_open(self):
+        return self._signed_path("GET", self.open_path, {"symbol": self.symbol})
+
+    def position_amt(self):
+        if not self.is_futures:
+            return 0.0
+        data = self._signed_path("GET", "/fapi/v2/positionRisk", {"symbol": self.symbol})
+        return sum(float(p.get("positionAmt", 0) or 0) for p in data)
+
+    def reconcile(self):
+        # Снимаем ТОЛЬКО свои ордера (clientOrderId с префиксом "lt"),
+        # чужие ордера по символу не трогаем. Возвращаем (снято, осталось, позиция).
+        ours = [o for o in self.list_open()
+                if str(o.get("clientOrderId", "")).startswith("lt")]
+        for o in ours:
+            try:
+                self._signed_path("DELETE", self.path,
+                                  {"symbol": self.symbol,
+                                   "origClientOrderId": o["clientOrderId"]})
+            except Exception:
+                pass
+        left = [o for o in self.list_open()
+                if str(o.get("clientOrderId", "")).startswith("lt")]
+        return len(ours), len(left), self.position_amt()
+
 
 class OkxRest:
     def __init__(self, cfg):
@@ -202,6 +234,7 @@ class OkxRest:
         self.secret = cfg["api_secret"].encode()
         self.passphrase = cfg["passphrase"]
         self.timeout = cfg.get("timeout_sec", 10)
+        self.inst = cfg["inst_id"]
         self.session = requests.Session()
 
     def _ts(self):
@@ -246,6 +279,31 @@ class OkxRest:
                              {"instId": self.cfg["inst_id"], "clOrdId": cl})["data"][0]
         if item.get("sCode") != "0":
             raise RuntimeError(f"ордер не отменён: {item}")
+
+    def list_open(self):
+        return self._request("GET", f"/api/v5/trade/orders-pending?instId={self.inst}",
+                             None)["data"]
+
+    def position_amt(self):
+        if not self.inst.endswith("-SWAP"):
+            return 0.0
+        data = self._request("GET", f"/api/v5/account/positions?instId={self.inst}",
+                             None)["data"]
+        return sum(float(p.get("pos") or 0) for p in data)
+
+    def reconcile(self):
+        # Снимаем ТОЛЬКО свои ордера (clOrdId с префиксом "lt").
+        ours = [o for o in self.list_open()
+                if str(o.get("clOrdId", "")).startswith("lt")]
+        for o in ours:
+            try:
+                self._request("POST", "/api/v5/trade/cancel-order",
+                              {"instId": self.inst, "ordId": o["ordId"]})
+            except Exception:
+                pass
+        left = [o for o in self.list_open()
+                if str(o.get("clOrdId", "")).startswith("lt")]
+        return len(ours), len(left), self.position_amt()
 
 
 # =========================================================================== #
@@ -524,6 +582,125 @@ def _auto_price(key, fn):
 
 
 # =========================================================================== #
+#             Авто-размер: минимальный валидный объём ордера                  #
+# =========================================================================== #
+# Берём с биржи минимальный размер и шаг, проверяем минимальный номинал и
+# отдаём наименьший объём, который биржа примет. Так «минимальный размер»
+# из чек-листа выполняется точно, без ручного подбора. Для OKX SWAP размер
+# считается в КОНТРАКТАХ (1 контракт = ctVal базовой валюты), не в BTC.
+
+_size_cache = {}
+
+
+def auto_size_on(cfg):
+    if "--auto-size" in sys.argv:
+        return True
+    env = os.environ.get("AUTO_SIZE", "").strip().lower()
+    if env in ("1", "yes", "true", "on"):
+        return True
+    if env in ("0", "no", "false", "off"):
+        return False
+    return bool(cfg.get("auto_size", False))
+
+
+def _round_up_to_step(value, step):
+    v = Decimal(str(value))
+    s = Decimal(str(step))
+    if s <= 0:
+        return v
+    return (v / s).to_integral_value(rounding=ROUND_UP) * s
+
+
+def _fmt_step(value, step):
+    s = Decimal(str(step))
+    exp = s.as_tuple().exponent
+    decimals = -exp if exp < 0 else 0
+    return f"{Decimal(str(value)):.{decimals}f}"
+
+
+def _min_qty_for_notional(price, min_qty, step, min_notional):
+    """Binance: max(minQty, minNotional/price), округлённый ВВЕРХ к stepSize."""
+    price = Decimal(str(price))
+    q = Decimal(str(min_qty))
+    if min_notional and price > 0:
+        need = Decimal(str(min_notional)) / price
+        if need > q:
+            q = need
+    q = _round_up_to_step(q, step)
+    floor_q = _round_up_to_step(Decimal(str(min_qty)), step)
+    if q < floor_q:
+        q = floor_q
+    return _fmt_step(q, step)
+
+
+def _okx_min_size(min_sz, lot_sz):
+    """OKX: минимальный размер minSz, округлённый вверх к шагу lotSz."""
+    size = _round_up_to_step(Decimal(str(min_sz)), lot_sz)
+    if size < Decimal(str(min_sz)):
+        size = _round_up_to_step(Decimal(str(min_sz)), lot_sz)
+    return _fmt_step(size, lot_sz)
+
+
+def binance_min_order_size(cfg, market):
+    base = cfg["base_url"].rstrip("/")
+    symbol = cfg["symbol"]
+    timeout = cfg.get("timeout_sec", 10)
+    is_futures = market == "futures"
+    info_path = "/fapi/v1/exchangeInfo" if is_futures else "/api/v3/exchangeInfo"
+    if is_futures:
+        info = requests.get(base + info_path, timeout=timeout).json()
+        sym = next(s for s in info["symbols"] if s["symbol"] == symbol)
+    else:
+        info = requests.get(base + info_path, params={"symbol": symbol}, timeout=timeout).json()
+        sym = info["symbols"][0]
+    filt = {f["filterType"]: f for f in sym["filters"]}
+    lot = filt.get("LOT_SIZE", {})
+    min_qty = lot.get("minQty", "0")
+    step = lot.get("stepSize", "0")
+    notf = filt.get("MIN_NOTIONAL") or filt.get("NOTIONAL") or {}
+    min_notional = notf.get("minNotional") or notf.get("notional") or 0
+    return _min_qty_for_notional(float(cfg["price"]), min_qty, step, min_notional)
+
+
+def okx_min_order_size(cfg):
+    base = cfg["base_url"].rstrip("/")
+    inst = cfg["inst_id"]
+    timeout = cfg.get("timeout_sec", 10)
+    headers = {}
+    if cfg.get("simulated", False):
+        headers["x-simulated-trading"] = "1"
+    inst_type = "SWAP" if inst.endswith("-SWAP") else "SPOT"
+    ins = requests.get(base + "/api/v5/public/instruments",
+                       params={"instType": inst_type, "instId": inst},
+                       headers=headers, timeout=timeout).json()
+    if ins.get("code") != "0" or not ins.get("data"):
+        raise RuntimeError(f"OKX instruments: {ins}")
+    d = ins["data"][0]
+    min_sz = d.get("minSz", "0")
+    lot_sz = d.get("lotSz", "0") or min_sz
+    return _okx_min_size(min_sz, lot_sz)
+
+
+def _auto_size(key, fn):
+    if key not in _size_cache:
+        size = fn()
+        _size_cache[key] = size
+        print(f"  [auto-size] {key[0]} {key[1]}: {size}")
+    return _size_cache[key]
+
+
+def _arg(name, default=None):
+    """Чтение --name value или --name=value из argv."""
+    pref = "--" + name
+    for i, a in enumerate(sys.argv):
+        if a == pref and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(pref + "="):
+            return a.split("=", 1)[1]
+    return default
+
+
+# =========================================================================== #
 #                                 Замер                                       #
 # =========================================================================== #
 REPEATS = int(os.environ.get("LATENCY_REPEATS", "5"))  # циклов "отправка+отмена"
@@ -533,7 +710,7 @@ def _ms(a, b):
     return (b - a) * 1000.0
 
 
-def measure(place_fn, cancel_fn, repeats=REPEATS):
+def measure(place_fn, cancel_fn, repeats=None):
     """
     1) Первый ордер: меряем только размещение (для REST оно "холодное" -
        включает установку соединения). Его отмену НЕ учитываем - чистим.
@@ -541,6 +718,8 @@ def measure(place_fn, cancel_fn, repeats=REPEATS):
        усредняем размещения и отмены по повторам.
     Итого повт. = среднее размещение + средняя отмена.
     """
+    if repeats is None:
+        repeats = REPEATS
     t0 = time.perf_counter()
     order_id = place_fn()                       # подтверждение размещения
     first_place = _ms(t0, time.perf_counter())
@@ -576,17 +755,37 @@ def measure_ws(client):
         client.close()
 
 
-def run_binance(market, transport):
+def binance_cfg(market):
     full = load_config(CONFIG_BINANCE)
     cfg = dict(full[market])
-    for k in ("auto_price", "price_offset_pct"):   # допускаем и общий ключ конфига
+    for k in ("auto_price", "price_offset_pct", "auto_size"):   # общие ключи конфига
         if k in full and k not in cfg:
             cfg[k] = full[k]
     cfg["api_key"], cfg["api_secret"] = binance_credentials(market)
+    return cfg
+
+
+def okx_cfg(market):
+    full = load_config(CONFIG_OKX)
+    shared = {k: full[k] for k in
+              ("base_url", "ws_url", "simulated", "timeout_sec",
+               "auto_price", "price_offset_pct", "auto_size")
+              if k in full}
+    cfg = {**shared, **full[market]}
+    cfg["api_key"], cfg["api_secret"], cfg["passphrase"] = okx_credentials()
+    return cfg
+
+
+def run_binance(market, transport):
+    cfg = binance_cfg(market)
     if auto_price_on(cfg):
         cfg["price"] = _auto_price(
             ("Binance", market),
             lambda: binance_safe_price(cfg, market, price_offset(cfg)))
+    if auto_size_on(cfg):
+        cfg["quantity"] = _auto_size(
+            ("Binance", market),
+            lambda: binance_min_order_size(cfg, market))
     if transport == "API":
         c = BinanceRest(cfg, market)
         return measure(c.place_order, c.cancel_order)
@@ -594,35 +793,55 @@ def run_binance(market, transport):
 
 
 def run_okx(market, transport):
-    full = load_config(CONFIG_OKX)
-    shared = {k: full[k] for k in
-              ("base_url", "ws_url", "simulated", "timeout_sec",
-               "auto_price", "price_offset_pct")
-              if k in full}
-    cfg = {**shared, **full[market]}
-    cfg["api_key"], cfg["api_secret"], cfg["passphrase"] = okx_credentials()
+    cfg = okx_cfg(market)
     if auto_price_on(cfg):
         cfg["price"] = _auto_price(
             ("OKX", market),
             lambda: okx_safe_price(cfg, price_offset(cfg)))
+    if auto_size_on(cfg):
+        cfg["size"] = _auto_size(
+            ("OKX", market),
+            lambda: okx_min_order_size(cfg))
     if transport == "API":
         c = OkxRest(cfg)
         return measure(c.place_order, c.cancel_order)
     return measure_ws(OkxWs(cfg))
 
 
-MARKETS = [
-    ("Binance Futures", run_binance, "futures"),
-    ("Binance Spot",    run_binance, "spot"),
-    ("OKX Futures",     run_okx,     "futures"),
-    ("OKX Spot",        run_okx,     "spot"),
+def reconcile_market(exch, market):
+    """Защитная зачистка после прогона: снимаем свои висячие ордера и
+    проверяем позицию (на случай reject/таймаута/частичного исполнения)."""
+    if exch == "binance":
+        c = BinanceRest(binance_cfg(market), market)
+        label = f"Binance {market}"
+    else:
+        c = OkxRest(okx_cfg(market))
+        label = f"OKX {market}"
+    cancelled, left, pos = c.reconcile()
+    note = f"снято наших={cancelled}, осталось={left}, позиция={pos:g}"
+    if left or abs(pos) > 1e-12:
+        print(f"  [reconcile] {label}: ⚠ {note} — ПРОВЕРЬТЕ ВРУЧНУЮ!")
+    else:
+        print(f"  [reconcile] {label}: ок ({note})")
+
+
+ALL_MARKETS = [
+    ("Binance Futures", run_binance, "futures", "binance"),
+    ("Binance Spot",    run_binance, "spot",    "binance"),
+    ("OKX Futures",     run_okx,     "futures", "okx"),
+    ("OKX Spot",        run_okx,     "spot",    "okx"),
 ]
+
+
+def select_markets(exch, mkt):
+    return [row for row in ALL_MARKETS
+            if exch in ("both", row[3]) and mkt in ("both", row[2])]
 
 
 # =========================================================================== #
 #                                 Таблица                                     #
 # =========================================================================== #
-def print_table(results):
+def print_table(results, markets):
     W_LABEL, W_NUM = 18, 15
     line = "─" * (W_LABEL + W_NUM * 4)
     h1 = ("Первый", "Повторный", "Отмена", "Итого")
@@ -636,7 +855,7 @@ def print_table(results):
     print(f"{'':<{W_LABEL}}" + "".join(f"{x:>{W_NUM}}" for x in h2))
     print(line)
 
-    for label, _, _ in MARKETS:
+    for label, _, _, _ in markets:
         print(label)
         row = results[label]
         for transport, disp in (("API", "REST API"), ("WS", "WS API")):
@@ -659,8 +878,8 @@ def confirm_live(skip):
     bar = "!" * 70
     print("\n" + bar)
     print("ВНИМАНИЕ: будут размещены РЕАЛЬНЫЕ ордера на БОЕВЫХ счетах (PROD).")
-    print("Ордера лимитные и стоят далеко от рынка, сразу отменяются, но это")
-    print("РЕАЛЬНЫЕ ДЕНЬГИ. Убедитесь, что цены/объёмы в конфигах безопасны.")
+    print("Ордера лимитные (BUY ниже / SELL выше рынка), сразу отменяются, но")
+    print("это РЕАЛЬНЫЕ ДЕНЬГИ. Убедитесь, что цены/объёмы безопасны (см. README).")
     print(bar)
     try:
         ans = input("Введите 'yes' для продолжения: ").strip().lower()
@@ -672,13 +891,29 @@ def confirm_live(skip):
 
 
 def main():
+    global REPEATS
     skip_confirm = ("--yes" in sys.argv or "-y" in sys.argv
                     or os.environ.get("LATENCY_CONFIRM", "").lower() in ("1", "yes", "true"))
-    confirm_live(skip_confirm)
+    exch = _arg("exchange", "both").lower()
+    mkt = _arg("market", "both").lower()
+    reps = _arg("repeats")
+    if reps:
+        try:
+            REPEATS = int(reps)
+        except ValueError:
+            pass
 
-    print("Замер задержки (БОЕВЫЕ счета). Прогон может занять несколько секунд...")
+    markets = select_markets(exch, mkt)
+    if not markets:
+        print(f"Нет рынков под фильтр exchange={exch} market={mkt}.")
+        print("Допустимо: --exchange both|binance|okx, --market both|spot|futures")
+        return
+
+    confirm_live(skip_confirm)
+    print(f"Замер задержки (БОЕВЫЕ счета): exchange={exch}, market={mkt}, "
+          f"repeats={REPEATS}. Прогон может занять несколько секунд...")
     results = {}
-    for label, fn, market in MARKETS:
+    for label, fn, market, exch_name in markets:
         row = {}
         for transport in ("API", "WS"):
             try:
@@ -686,7 +921,11 @@ def main():
             except Exception as e:
                 row[transport] = e
         results[label] = row
-    print_table(results)
+        try:
+            reconcile_market(exch_name, market)
+        except Exception as e:
+            print(f"  [reconcile] {label}: ✗ {e}")
+    print_table(results, markets)
 
 
 if __name__ == "__main__":
