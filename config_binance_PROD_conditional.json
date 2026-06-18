@@ -1,0 +1,37 @@
+{
+    "name": "Binance (PROD) — УСЛОВНЫЙ (trigger) бенчмарк",
+    "_comment": "Включается флагом --conditional / CONDITIONAL=1. Ключи берутся из .env.",
+    "_safety": "Триггер недостижим (stop_price=1000 при рынке ~64000), ордер сработать не может и сразу отменяется. Размер крупный только для замера — на латентность place/cancel размер НЕ влияет. Перед запуском работает balance-guard: откажет, если на счёте > MAX_EQUITY_USDT (по умолчанию 50). Условный бенчмарк рассчитан на ФЬЮЧЕРСЫ: --conditional --exchange binance --market futures.",
+
+    "auto_price": false,
+    "auto_size": false,
+
+    "futures": {
+        "base_url": "https://fapi.binance.com",
+        "ws_url": "wss://ws-fapi.binance.com/ws-fapi/v1",
+
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "TAKE_PROFIT_MARKET",
+        "stop_price": "1000",
+        "working_type": "MARK_PRICE",
+        "quantity": "100",
+        "recv_window": 5000,
+        "timeout_sec": 10
+    },
+
+    "spot": {
+        "_comment": "Спот: условный бенчмарк 100 BTC невозможен (резерв средств при размещении). Здесь обычный лимит с минимальным размером — для измерения спота используйте auto-price/auto-size.",
+        "base_url": "https://api.binance.com",
+        "ws_url": "wss://ws-api.binance.com/ws-api/v3",
+
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "20000",
+        "quantity": "0.0006",
+        "time_in_force": "GTC",
+        "recv_window": 5000,
+        "timeout_sec": 10
+    }
+}

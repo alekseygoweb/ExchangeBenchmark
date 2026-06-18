@@ -89,6 +89,11 @@ load_env_file()
 # Пути к конфигам можно переопределить через окружение/.env.
 CONFIG_BINANCE = os.environ.get("CONFIG_BINANCE", "config_binance_PROD.json")
 CONFIG_OKX = os.environ.get("CONFIG_OKX", "config_okx_PROD.json")
+# Отдельный конфиг для условного (trigger) бенчмарка Binance — включается флагом
+# --conditional / CONDITIONAL=1. Держим его отдельным файлом, чтобы обычный прогон
+# по умолчанию оставался безопасным лимитным, а «заряженный» конфиг был явным opt-in.
+CONFIG_BINANCE_CONDITIONAL = os.environ.get(
+    "CONFIG_BINANCE_CONDITIONAL", "config_binance_PROD_conditional.json")
 
 
 def _require_env(name):
@@ -143,6 +148,41 @@ def gen_cl_id():
     return "lt" + uuid.uuid4().hex[:20]
 
 
+# Условные (trigger) типы Binance: лимитные требуют price+timeInForce,
+# рыночные (*_MARKET) — нет. stopPrice обязателен для всех условных.
+LIMIT_CONDITIONAL_TYPES = {"STOP", "TAKE_PROFIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"}
+MARKET_CONDITIONAL_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"}
+
+
+def is_conditional(cfg):
+    return str(cfg.get("type", "LIMIT")).upper() != "LIMIT"
+
+
+def binance_order_params(cfg, is_futures, cl):
+    """Параметры ордера Binance: обычный LIMIT либо условный (trigger).
+
+    Тип берётся из cfg["type"] (по умолчанию LIMIT). Один и тот же конструктор
+    используют REST и WS, чтобы оба транспорта слали идентичный ордер.
+    """
+    otype = str(cfg.get("type", "LIMIT")).upper()
+    params = {
+        "symbol": cfg["symbol"],
+        "side": cfg.get("side", "BUY"),
+        "type": otype,
+        "quantity": cfg["quantity"],
+        "newClientOrderId": cl,
+    }
+    is_market_cond = otype in MARKET_CONDITIONAL_TYPES
+    if not is_market_cond:                      # LIMIT и лимитные условные
+        params["price"] = cfg["price"]
+        params["timeInForce"] = cfg.get("time_in_force", "GTC")
+    if is_market_cond or otype in LIMIT_CONDITIONAL_TYPES:
+        params["stopPrice"] = cfg["stop_price"]
+        if is_futures and cfg.get("working_type"):
+            params["workingType"] = cfg["working_type"]
+    return params
+
+
 # =========================================================================== #
 #                              REST (API)                                     #
 # =========================================================================== #
@@ -182,18 +222,24 @@ class BinanceRest:
 
     def place_order(self):
         cl = gen_cl_id()
-        data = self._signed("POST", {
-            "symbol": self.cfg["symbol"],
-            "side": self.cfg.get("side", "BUY"),
-            "type": "LIMIT",
-            "timeInForce": self.cfg.get("time_in_force", "GTC"),
-            "quantity": self.cfg["quantity"],
-            "price": self.cfg["price"],
-            "newClientOrderId": cl,
-        })
+        data = self._signed("POST", binance_order_params(self.cfg, self.is_futures, cl))
         if data.get("status") not in ("NEW", "PARTIALLY_FILLED", "FILLED"):
             raise RuntimeError(f"ордер не размещён: {data}")
         return cl
+
+    def available_usdt(self):
+        """Свободный баланс USDT (для balance-guard перед условным ордером)."""
+        if self.is_futures:
+            data = self._signed_path("GET", "/fapi/v2/balance", {})
+            for b in data:
+                if b.get("asset") == "USDT":
+                    return float(b.get("availableBalance", 0) or 0)
+            return 0.0
+        data = self._signed_path("GET", "/api/v3/account", {})
+        for b in data.get("balances", []):
+            if b.get("asset") == "USDT":
+                return float(b.get("free", 0) or 0)
+        return 0.0
 
     def cancel_order(self, cl):
         data = self._signed("DELETE", {"symbol": self.cfg["symbol"], "origClientOrderId": cl})
@@ -313,6 +359,7 @@ class BinanceWs:
     def __init__(self, cfg, market):
         self.cfg = cfg
         self.url = cfg["ws_url"]
+        self.is_futures = market == "futures"
         # WS может жить в другой системе, чем REST - тогда нужен отдельный ключ.
         # Для PROD это обычно тот же ключ, что и у REST.
         self.key = cfg.get("ws_api_key", cfg["api_key"])
@@ -351,15 +398,7 @@ class BinanceWs:
 
     def place_order(self):
         cl = gen_cl_id()
-        res = self._call("order.place", {
-            "symbol": self.cfg["symbol"],
-            "side": self.cfg.get("side", "BUY"),
-            "type": "LIMIT",
-            "timeInForce": self.cfg.get("time_in_force", "GTC"),
-            "quantity": self.cfg["quantity"],
-            "price": self.cfg["price"],
-            "newClientOrderId": cl,
-        })
+        res = self._call("order.place", binance_order_params(self.cfg, self.is_futures, cl))
         if res.get("status") not in ("NEW", "PARTIALLY_FILLED", "FILLED"):
             raise RuntimeError(f"ордер не размещён: {res}")
         return cl
@@ -700,6 +739,109 @@ def _arg(name, default=None):
     return default
 
 
+def _flag(name, env, default=False):
+    if "--" + name in sys.argv:
+        return True
+    val = os.environ.get(env, "").strip().lower()
+    if val in ("1", "yes", "true", "on"):
+        return True
+    if val in ("0", "no", "false", "off"):
+        return False
+    return default
+
+
+# =========================================================================== #
+#        Условный режим, balance-guard и проверка серверного времени          #
+# =========================================================================== #
+# Условный (trigger) бенчмарк включается флагом --conditional / CONDITIONAL=1 и
+# использует ОТДЕЛЬНЫЙ конфиг Binance (CONFIG_BINANCE_CONDITIONAL). Ордер не может
+# сработать (триггер недостижим), но размер крупный — поэтому добавлен balance-guard:
+# перед размещением проверяем свободный баланс и ОТКАЗЫВАЕМ, если на счёте достаточно
+# средств, чтобы условие реально открыло позицию. Это снимает единственный реальный
+# риск такой схемы — «безопасно только на пустом счёте, опасно после пополнения».
+
+_guard_cache = {}
+
+
+def conditional_on():
+    return _flag("conditional", "CONDITIONAL", False)
+
+
+def balance_guard_on():
+    return _flag("no-balance-guard", "NO_BALANCE_GUARD", False) is False \
+        and _flag("balance-guard", "BALANCE_GUARD", True)
+
+
+def max_equity_usdt():
+    try:
+        return float(os.environ.get("MAX_EQUITY_USDT", "50"))
+    except ValueError:
+        return 50.0
+
+
+def balance_guard(cfg, market):
+    """Пускаем условный ордер только если на счёте слишком мало средств, чтобы он
+    мог что-то открыть. Иначе — стоп с явным сообщением."""
+    key = ("Binance", market)
+    ceil = max_equity_usdt()
+    fresh = key not in _guard_cache
+    if fresh:
+        _guard_cache[key] = BinanceRest(cfg, market).available_usdt()
+    avail = _guard_cache[key]
+    if avail > ceil:
+        raise RuntimeError(
+            f"balance-guard: доступно {avail:.2f} USDT > порога {ceil:.0f}. "
+            f"Условный ордер {cfg.get('quantity')} {cfg.get('symbol')} на пополненном "
+            f"счёте может открыть позицию. Отключить: BALANCE_GUARD=0 / --no-balance-guard, "
+            f"или поднять порог MAX_EQUITY_USDT.")
+    if fresh:
+        print(f"  [balance-guard] Binance {market}: доступно {avail:.2f} USDT ≤ {ceil:.0f} — ок")
+
+
+def server_time_ms(exch, base, is_futures, simulated, timeout):
+    base = base.rstrip("/")
+    if exch == "binance":
+        path = "/fapi/v1/time" if is_futures else "/api/v3/time"
+        d = requests.get(base + path, timeout=timeout).json()
+        return int(d["serverTime"])
+    headers = {"x-simulated-trading": "1"} if simulated else {}
+    d = requests.get(base + "/api/v5/public/time", headers=headers, timeout=timeout).json()
+    return int(d["data"][0]["ts"])
+
+
+def time_sync_preflight(markets):
+    """Сверяем локальные часы с временем биржи: кривое время и портит замер,
+    и вызывает reject по recvWindow. Проверяем по одному разу на биржу."""
+    if _flag("skip-time-check", "SKIP_TIME_CHECK", False):
+        return
+    warn_ms, hard_ms = 500, 3000
+    seen = set()
+    for label, fn, market, exch in markets:
+        if exch in seen:
+            continue
+        seen.add(exch)
+        try:
+            cfg = binance_cfg(market) if exch == "binance" else okx_cfg(market)
+            t0 = now_ms()
+            srv = server_time_ms(exch, cfg["base_url"], market == "futures",
+                                 cfg.get("simulated", False), cfg.get("timeout_sec", 10))
+            t1 = now_ms()
+            offset = srv - (t0 + t1) // 2
+        except Exception as e:
+            print(f"  [time] {exch}: не удалось проверить ({e}) — пропускаю")
+            continue
+        a = abs(offset)
+        if a > hard_ms:
+            print(f"  [time] {exch}: offset {offset:+d} мс — СЛИШКОМ БОЛЬШОЙ (> {hard_ms}). "
+                  f"Синхронизируйте часы (README) или --skip-time-check.")
+            sys.exit(1)
+        elif a > warn_ms:
+            print(f"  [time] {exch}: offset {offset:+d} мс — ⚠ велик (> {warn_ms}), "
+                  f"замер может искажаться")
+        else:
+            print(f"  [time] {exch}: offset {offset:+d} мс — ок")
+
+
 # =========================================================================== #
 #                                 Замер                                       #
 # =========================================================================== #
@@ -756,7 +898,8 @@ def measure_ws(client):
 
 
 def binance_cfg(market):
-    full = load_config(CONFIG_BINANCE)
+    path = CONFIG_BINANCE_CONDITIONAL if conditional_on() else CONFIG_BINANCE
+    full = load_config(path)
     cfg = dict(full[market])
     for k in ("auto_price", "price_offset_pct", "auto_size"):   # общие ключи конфига
         if k in full and k not in cfg:
@@ -778,6 +921,8 @@ def okx_cfg(market):
 
 def run_binance(market, transport):
     cfg = binance_cfg(market)
+    if is_conditional(cfg) and balance_guard_on():
+        balance_guard(cfg, market)
     if auto_price_on(cfg):
         cfg["price"] = _auto_price(
             ("Binance", market),
@@ -847,8 +992,9 @@ def print_table(results, markets):
     h1 = ("Первый", "Повторный", "Отмена", "Итого")
     h2 = ("ордер", "ордер (ср.)", "ордера (ср.)", "повт. (ср.)")
 
+    kind = "условного (trigger)" if conditional_on() else "лимитного"
     print()
-    print("  Задержка лимитного ордера (БОЕВОЙ счёт), мс")
+    print(f"  Задержка {kind} ордера (БОЕВОЙ счёт), мс")
     print("  «Повторный» — среднее по {} циклам на прогретом соединении".format(REPEATS))
     print(line)
     print(f"{'':<{W_LABEL}}" + "".join(f"{x:>{W_NUM}}" for x in h1))
@@ -878,8 +1024,13 @@ def confirm_live(skip):
     bar = "!" * 70
     print("\n" + bar)
     print("ВНИМАНИЕ: будут размещены РЕАЛЬНЫЕ ордера на БОЕВЫХ счетах (PROD).")
-    print("Ордера лимитные (BUY ниже / SELL выше рынка), сразу отменяются, но")
-    print("это РЕАЛЬНЫЕ ДЕНЬГИ. Убедитесь, что цены/объёмы безопасны (см. README).")
+    if conditional_on():
+        print("Режим УСЛОВНЫЙ (trigger): крупный ордер с НЕДОСТИЖИМЫМ триггером,")
+        print("сразу отменяется. Сработать не может, плюс balance-guard блокирует")
+        print("запуск на счёте с достаточной маржой. Но это РЕАЛЬНЫЕ ДЕНЬГИ.")
+    else:
+        print("Ордера лимитные (BUY ниже / SELL выше рынка), сразу отменяются, но")
+        print("это РЕАЛЬНЫЕ ДЕНЬГИ. Убедитесь, что цены/объёмы безопасны (см. README).")
     print(bar)
     try:
         ans = input("Введите 'yes' для продолжения: ").strip().lower()
@@ -910,8 +1061,10 @@ def main():
         return
 
     confirm_live(skip_confirm)
-    print(f"Замер задержки (БОЕВЫЕ счета): exchange={exch}, market={mkt}, "
-          f"repeats={REPEATS}. Прогон может занять несколько секунд...")
+    mode = "УСЛОВНЫЙ (trigger)" if conditional_on() else "лимитный"
+    print(f"Замер задержки (БОЕВЫЕ счета): режим={mode}, exchange={exch}, "
+          f"market={mkt}, repeats={REPEATS}. Прогон может занять несколько секунд...")
+    time_sync_preflight(markets)
     results = {}
     for label, fn, market, exch_name in markets:
         row = {}
