@@ -1,7 +1,7 @@
 {
     "name": "Binance (PROD) — УСЛОВНЫЙ (trigger) бенчмарк",
     "_comment": "Включается флагом --conditional / CONDITIONAL=1. Ключи берутся из .env.",
-    "_safety": "Триггер недостижим (stop_price=1000 при рынке ~64000), ордер сработать не может и сразу отменяется. Размер крупный только для замера — на латентность place/cancel размер НЕ влияет. Перед запуском работает balance-guard: откажет, если на счёте > MAX_EQUITY_USDT (по умолчанию 50). Условный бенчмарк рассчитан на ФЬЮЧЕРСЫ: --conditional --exchange binance --market futures.",
+    "_safety": "BUY STOP_MARKET с НЕДОСТИЖИМО ВЫСОКИМ триггером (stop_price=1000000 при рынке ~64000): срабатывает только при росте цены до 1 000 000 — то есть никогда. Ордер не резервирует маржу до срабатывания (работает на пустом фьючерсном кошельке), сразу отменяется. Размер крупный только для замера — на латентность place/cancel размер НЕ влияет. Перед запуском работает balance-guard: откажет, если на счёте > MAX_EQUITY_USDT (по умолчанию 50). В hedge-режиме STOP_MARKET — корректный ОТКРЫВАЮЩИЙ условный для LONG (TAKE_PROFIT_MARKET даёт -4120). Бенчмарк рассчитан на ФЬЮЧЕРСЫ: --conditional --exchange binance --market futures.",
 
     "auto_price": false,
     "auto_size": false,
@@ -12,8 +12,8 @@
 
         "symbol": "BTCUSDT",
         "side": "BUY",
-        "type": "TAKE_PROFIT_MARKET",
-        "stop_price": "1000",
+        "type": "STOP_MARKET",
+        "stop_price": "1000000",
         "working_type": "MARK_PRICE",
         "quantity": "100",
         "recv_window": 5000,
