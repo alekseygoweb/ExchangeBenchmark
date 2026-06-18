@@ -1,0 +1,30 @@
+{
+    "name": "Binance (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи API берутся из .env (BINANCE_API_KEY / BINANCE_API_SECRET), здесь их нет.",
+
+    "futures": {
+        "base_url": "https://fapi.binance.com",
+        "ws_url": "wss://ws-fapi.binance.com/ws-fapi/v1",
+
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "price": "20000",
+        "quantity": "0.006",
+        "time_in_force": "GTC",
+        "recv_window": 5000,
+        "timeout_sec": 10
+    },
+
+    "spot": {
+        "base_url": "https://api.binance.com",
+        "ws_url": "wss://ws-api.binance.com/ws-api/v3",
+
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "price": "20000",
+        "quantity": "0.0006",
+        "time_in_force": "GTC",
+        "recv_window": 5000,
+        "timeout_sec": 10
+    }
+}

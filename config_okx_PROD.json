@@ -1,0 +1,25 @@
+{
+    "name": "OKX (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи API берутся из .env (OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE), здесь их нет.",
+
+    "base_url": "https://www.okx.com",
+    "ws_url": "wss://ws.okx.com:8443/ws/v5/private",
+    "simulated": false,
+    "timeout_sec": 10,
+
+    "futures": {
+        "inst_id": "BTC-USDT-SWAP",
+        "td_mode": "cross",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.01"
+    },
+
+    "spot": {
+        "inst_id": "BTC-USDT",
+        "td_mode": "cash",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.001"
+    }
+}

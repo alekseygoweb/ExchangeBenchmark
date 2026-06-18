@@ -1,0 +1,13 @@
+# Секреты — НИКОГДА не коммитим
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
