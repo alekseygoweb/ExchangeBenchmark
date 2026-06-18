@@ -7,6 +7,9 @@
     "simulated": false,
     "timeout_sec": 10,
 
+    "auto_price": false,
+    "price_offset_pct": 1.0,
+
     "futures": {
         "inst_id": "BTC-USDT-SWAP",
         "td_mode": "cross",

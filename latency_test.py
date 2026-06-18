@@ -36,6 +36,7 @@ import hmac
 import uuid
 import base64
 import hashlib
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
@@ -406,6 +407,123 @@ class OkxWs:
 
 
 # =========================================================================== #
+#               Авто-цена: безопасный неисполняемый лимит                     #
+# =========================================================================== #
+# Идея: вместо ручной подгонки "price" в конфиге считаем цену от текущего
+# рынка. Для BUY берём лучший бид и опускаемся на offset% ниже, для SELL -
+# лучший аск плюс offset%. Цена округляется к шагу инструмента (tickSize).
+# Так ордер заведомо не пересекает спред (не исполняется) и при этом
+# попадает в ценовой коридор биржи (Binance PERCENT_PRICE(_BY_SIDE),
+# OKX price-limit), из-за которого фиксированная заглушка "20000" отклоняется.
+# Все запросы цены идут ДО таймера и на сам замер задержки не влияют.
+
+_price_cache = {}
+
+
+def auto_price_on(cfg):
+    """Включена ли авто-цена: CLI-флаг / env / ключ в конфиге."""
+    if "--auto-price" in sys.argv:
+        return True
+    env = os.environ.get("AUTO_PRICE", "").strip().lower()
+    if env in ("1", "yes", "true", "on"):
+        return True
+    if env in ("0", "no", "false", "off"):
+        return False
+    return bool(cfg.get("auto_price", False))
+
+
+def price_offset(cfg):
+    """Отступ от рынка в долях (PRICE_OFFSET в процентах; по умолчанию 1%)."""
+    val = os.environ.get("PRICE_OFFSET")
+    if val is None:
+        val = cfg.get("price_offset_pct", 1.0)
+    try:
+        return float(val) / 100.0
+    except (TypeError, ValueError):
+        return 0.01
+
+
+def _round_to_tick(value, tick, is_buy):
+    """Округляем к шагу цены: BUY вниз, SELL вверх (чтобы не приблизиться к рынку)."""
+    v = Decimal(str(value))
+    t = Decimal(str(tick))
+    if t <= 0:
+        return format(v, "f")
+    steps = (v / t).to_integral_value(rounding=ROUND_DOWN if is_buy else ROUND_UP)
+    price = steps * t
+    exp = t.as_tuple().exponent
+    decimals = -exp if exp < 0 else 0
+    return f"{price:.{decimals}f}"
+
+
+def _compute_price(cfg, best_bid, best_ask, tick, offset):
+    if best_bid <= 0 or best_ask <= 0:
+        raise RuntimeError(f"некорректные лучшие цены: bid={best_bid} ask={best_ask}")
+    is_buy = str(cfg.get("side", "BUY")).upper().startswith("B")
+    if is_buy:
+        raw = best_bid * (1.0 - offset)
+    else:
+        raw = best_ask * (1.0 + offset)
+    return _round_to_tick(raw, tick, is_buy)
+
+
+def binance_safe_price(cfg, market, offset):
+    base = cfg["base_url"].rstrip("/")
+    symbol = cfg["symbol"]
+    timeout = cfg.get("timeout_sec", 10)
+    is_futures = market == "futures"
+    book_path = "/fapi/v1/ticker/bookTicker" if is_futures else "/api/v3/ticker/bookTicker"
+    info_path = "/fapi/v1/exchangeInfo" if is_futures else "/api/v3/exchangeInfo"
+
+    bt = requests.get(base + book_path, params={"symbol": symbol}, timeout=timeout).json()
+    best_bid, best_ask = float(bt["bidPrice"]), float(bt["askPrice"])
+
+    if is_futures:
+        # fapi exchangeInfo отдаёт все символы - фильтруем сами.
+        info = requests.get(base + info_path, timeout=timeout).json()
+        sym = next(s for s in info["symbols"] if s["symbol"] == symbol)
+    else:
+        info = requests.get(base + info_path, params={"symbol": symbol}, timeout=timeout).json()
+        sym = info["symbols"][0]
+    tick = next(f["tickSize"] for f in sym["filters"] if f["filterType"] == "PRICE_FILTER")
+    return _compute_price(cfg, best_bid, best_ask, tick, offset)
+
+
+def okx_safe_price(cfg, offset):
+    base = cfg["base_url"].rstrip("/")
+    inst = cfg["inst_id"]
+    timeout = cfg.get("timeout_sec", 10)
+    headers = {}
+    if cfg.get("simulated", False):
+        headers["x-simulated-trading"] = "1"
+
+    tk = requests.get(base + "/api/v5/market/ticker", params={"instId": inst},
+                      headers=headers, timeout=timeout).json()
+    if tk.get("code") != "0" or not tk.get("data"):
+        raise RuntimeError(f"OKX ticker: {tk}")
+    d = tk["data"][0]
+    best_bid, best_ask = float(d["bidPx"]), float(d["askPx"])
+
+    inst_type = "SWAP" if inst.endswith("-SWAP") else "SPOT"
+    ins = requests.get(base + "/api/v5/public/instruments",
+                       params={"instType": inst_type, "instId": inst},
+                       headers=headers, timeout=timeout).json()
+    if ins.get("code") != "0" or not ins.get("data"):
+        raise RuntimeError(f"OKX instruments: {ins}")
+    tick = ins["data"][0]["tickSz"]
+    return _compute_price(cfg, best_bid, best_ask, tick, offset)
+
+
+def _auto_price(key, fn):
+    """Считаем цену один раз на рынок (для API и WS), печатаем один раз."""
+    if key not in _price_cache:
+        price = fn()
+        _price_cache[key] = price
+        print(f"  [auto-price] {key[0]} {key[1]}: {price}")
+    return _price_cache[key]
+
+
+# =========================================================================== #
 #                                 Замер                                       #
 # =========================================================================== #
 REPEATS = int(os.environ.get("LATENCY_REPEATS", "5"))  # циклов "отправка+отмена"
@@ -459,8 +577,16 @@ def measure_ws(client):
 
 
 def run_binance(market, transport):
-    cfg = dict(load_config(CONFIG_BINANCE)[market])
+    full = load_config(CONFIG_BINANCE)
+    cfg = dict(full[market])
+    for k in ("auto_price", "price_offset_pct"):   # допускаем и общий ключ конфига
+        if k in full and k not in cfg:
+            cfg[k] = full[k]
     cfg["api_key"], cfg["api_secret"] = binance_credentials(market)
+    if auto_price_on(cfg):
+        cfg["price"] = _auto_price(
+            ("Binance", market),
+            lambda: binance_safe_price(cfg, market, price_offset(cfg)))
     if transport == "API":
         c = BinanceRest(cfg, market)
         return measure(c.place_order, c.cancel_order)
@@ -469,10 +595,16 @@ def run_binance(market, transport):
 
 def run_okx(market, transport):
     full = load_config(CONFIG_OKX)
-    shared = {k: full[k] for k in ("base_url", "ws_url", "simulated", "timeout_sec")
+    shared = {k: full[k] for k in
+              ("base_url", "ws_url", "simulated", "timeout_sec",
+               "auto_price", "price_offset_pct")
               if k in full}
     cfg = {**shared, **full[market]}
     cfg["api_key"], cfg["api_secret"], cfg["passphrase"] = okx_credentials()
+    if auto_price_on(cfg):
+        cfg["price"] = _auto_price(
+            ("OKX", market),
+            lambda: okx_safe_price(cfg, price_offset(cfg)))
     if transport == "API":
         c = OkxRest(cfg)
         return measure(c.place_order, c.cancel_order)
