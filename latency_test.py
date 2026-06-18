@@ -1046,6 +1046,7 @@ def print_table(results, markets):
     print(f"{'':<{W_LABEL}}" + "".join(f"{x:>{W_NUM}}" for x in h2))
     print(line)
 
+    errors = []
     for label, _, _, _ in markets:
         print(label)
         row = results[label]
@@ -1057,9 +1058,14 @@ def print_table(results, markets):
                 print(f"{tag:<{W_LABEL}}" + "".join(f"{x:>{W_NUM}.2f}" for x in cells))
             else:
                 msg = str(v)
-                msg = msg if len(msg) <= 44 else msg[:44] + "…"
-                print(f"{tag:<{W_LABEL}}  ✗ {msg}")
+                short = msg if len(msg) <= 44 else msg[:44] + "…"
+                print(f"{tag:<{W_LABEL}}  ✗ {short}")
+                errors.append((f"{label} / {disp}", msg))
     print(line)
+    if errors:
+        print("\n  Детали ошибок (полностью):")
+        for who, msg in errors:
+            print(f"  • {who}: {msg}")
 
 
 def confirm_live(skip):
