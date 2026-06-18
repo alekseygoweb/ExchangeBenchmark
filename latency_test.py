@@ -165,6 +165,10 @@ def binance_order_params(cfg, is_futures, cl):
     используют REST и WS, чтобы оба транспорта слали идентичный ордер.
     """
     otype = str(cfg.get("type", "LIMIT")).upper()
+    allowed = {"LIMIT"} | LIMIT_CONDITIONAL_TYPES | MARKET_CONDITIONAL_TYPES
+    if otype not in allowed:                     # fail-fast на опечатке в конфиге
+        raise RuntimeError(
+            f"неизвестный тип ордера '{otype}'; допустимо: {sorted(allowed)}")
     params = {
         "symbol": cfg["symbol"],
         "side": cfg.get("side", "BUY"),
