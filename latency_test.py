@@ -184,6 +184,8 @@ def binance_order_params(cfg, is_futures, cl):
         params["stopPrice"] = cfg["stop_price"]
         if is_futures and cfg.get("working_type"):
             params["workingType"] = cfg["working_type"]
+    if is_futures and cfg.get("position_side"):     # hedge-режим: LONG/SHORT
+        params["positionSide"] = cfg["position_side"]
     return params
 
 
@@ -230,6 +232,11 @@ class BinanceRest:
         if data.get("status") not in ("NEW", "PARTIALLY_FILLED", "FILLED"):
             raise RuntimeError(f"ордер не размещён: {data}")
         return cl
+
+    def dual_side_position(self):
+        """True, если фьючерсный счёт в режиме хеджирования (dual-side)."""
+        data = self._signed_path("GET", "/fapi/v1/positionSide/dual", {})
+        return bool(data.get("dualSidePosition", False))
 
     def available_usdt(self):
         """Свободный баланс USDT (для balance-guard перед условным ордером)."""
@@ -802,6 +809,37 @@ def balance_guard(cfg, market):
         print(f"  [balance-guard] Binance {market}: доступно {avail:.2f} USDT ≤ {ceil:.0f} — ок")
 
 
+_pos_side_cache = {}
+
+
+def resolve_position_side(cfg, market):
+    """Binance Futures в hedge-режиме требует positionSide в каждом ордере (иначе
+    -4061). Определяем режим счёта один раз и выводим positionSide из стороны
+    ордера. В one-way режиме возвращаем None (поле не нужно). Конфиг может задать
+    position_side явно — тогда детект пропускаем."""
+    if market != "futures":
+        return None
+    if cfg.get("position_side"):
+        return cfg["position_side"]
+    key = ("Binance", market)
+    if key not in _pos_side_cache:
+        try:
+            hedge = BinanceRest(cfg, market).dual_side_position()
+        except Exception as e:
+            print(f"  [pos-mode] Binance {market}: не удалось определить ({e}) — без positionSide")
+            _pos_side_cache[key] = None
+            return None
+        if hedge:
+            side = str(cfg.get("side", "BUY")).upper()
+            ps = "LONG" if side.startswith("B") else "SHORT"
+        else:
+            ps = None
+        _pos_side_cache[key] = ps
+        mode = f"hedge → positionSide={ps}" if ps else "one-way (positionSide не нужен)"
+        print(f"  [pos-mode] Binance {market}: {mode}")
+    return _pos_side_cache[key]
+
+
 def server_time_ms(exch, base, is_futures, simulated, timeout):
     base = base.rstrip("/")
     if exch == "binance":
@@ -935,6 +973,9 @@ def run_binance(market, transport):
         cfg["quantity"] = _auto_size(
             ("Binance", market),
             lambda: binance_min_order_size(cfg, market))
+    ps = resolve_position_side(cfg, market)         # hedge-режим фьючерсов
+    if ps:
+        cfg["position_side"] = ps
     if transport == "API":
         c = BinanceRest(cfg, market)
         return measure(c.place_order, c.cancel_order)

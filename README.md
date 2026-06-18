@@ -162,6 +162,19 @@ AUTO_PRICE=1 python latency_test.py --yes           # переменная ок�
 Позиция `≠ 0` означает, что какой-то ордер всё же исполнился — её скрипт
 **не закрывает сам** (это была бы новая сделка), а громко предупреждает.
 
+### Режим позиции на фьючерсах (hedge / one-way)
+
+Binance Futures в режиме хеджирования (dual-side) требует `positionSide`
+(LONG/SHORT) в каждом ордере — иначе `-4061 Order's position side does not
+match`. Скрипт определяет режим счёта автоматически (`GET
+/fapi/v1/positionSide/dual`) и в hedge-режиме ставит `positionSide` из стороны
+ордера (BUY→LONG, SELL→SHORT); в one-way режиме поле не добавляется. При желании
+можно задать `position_side` в конфиге явно. В начале фьючерсного прогона видно:
+
+```
+  [pos-mode] Binance futures: hedge → positionSide=LONG
+```
+
 ### Условный (trigger) бенчмарк
 
 На многих биржах условные/algo-ордера идут через **отдельную подсистему** с
