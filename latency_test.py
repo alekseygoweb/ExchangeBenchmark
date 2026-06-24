@@ -780,6 +780,8 @@ class MexcRest:
         path = "/api/v1/private/planorder/place/v2" if self.algo else "/api/v1/private/order/create"
         data = self._contract("POST", path, mexc_contract_params(self.cfg, cl))
         oid = data.get("data")
+        if isinstance(oid, dict):                    # order/create: data={orderId, ts}
+            oid = oid.get("orderId")                 # planorder/place/v2: data=строка orderId
         if not oid:
             raise RuntimeError(f"ордер не размещён: {data}")
         return oid                                   # отмена по orderId
