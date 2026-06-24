@@ -306,9 +306,10 @@ class BinanceRest:
 
     def cancel_order(self, cl):
         if self.algo:                               # условный → отмена на Algo-эндпоинте
+            # Cancel Algo Order принимает только algoId/clientAlgoId — symbol
+            # НЕ входит в параметры (лишний параметр → риск -1104).
             data = self._signed_path(
-                "DELETE", "/fapi/v1/algoOrder",
-                {"symbol": self.cfg["symbol"], "clientAlgoId": cl})
+                "DELETE", "/fapi/v1/algoOrder", {"clientAlgoId": cl})
             # Ответ отмены — {algoId, clientAlgoId, code:"200", msg:"success"}
             # (без algoStatus). Успех: code 200 / msg success / algoStatus CANCELED.
             code = str(data.get("code")) if data.get("code") is not None else None
@@ -343,8 +344,7 @@ class BinanceRest:
             try:
                 if self.algo:
                     self._signed_path("DELETE", "/fapi/v1/algoOrder",
-                                      {"symbol": self.symbol,
-                                       "clientAlgoId": o[id_field]})
+                                      {"clientAlgoId": o[id_field]})
                 else:
                     self._signed_path("DELETE", self.path,
                                       {"symbol": self.symbol,
