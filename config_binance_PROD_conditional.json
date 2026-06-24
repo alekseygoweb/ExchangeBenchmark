@@ -1,22 +1,22 @@
 {
     "name": "Binance (PROD) — УСЛОВНЫЙ (trigger) бенчмарк",
     "_comment": "Включается флагом --conditional / CONDITIONAL=1. Ключи берутся из .env.",
-    "_safety": "BUY STOP (лимитный условный) с НЕДОСТИЖИМО ВЫСОКИМ триггером (stop_price=1000000): срабатывает только при росте цены до 1 000 000 — никогда. Лимитная нога ставится в коридор через auto_price (ниже рынка, неисполнима). Маржу не резервирует до срабатывания (работает на пустом фьючерсном кошельке), сразу отменяется. Размер крупный только для замера — на латентность place/cancel размер НЕ влияет. balance-guard откажет, если на счёте > MAX_EQUITY_USDT (50). ПРИМЕЧАНИЕ: STOP_MARKET/TAKE_PROFIT_MARKET на этом счёте дают -4120 (нужен Algo API). Пробуем STOP-limit. Бенчмарк рассчитан на ФЬЮЧЕРСЫ: --conditional --exchange binance --market futures.",
+    "_safety": "Portfolio Margin (papi): BUY STOP_MARKET с НЕДОСТИЖИМО ВЫСОКИМ триггером (stop_price=1000000) — срабатывает только при росте цены до 1 000 000, то есть никогда. У рыночного условного нет лимитной цены, поэтому нет конфликта с price-фильтром — чистый недостижимый триггер. Маржу не резервирует до срабатывания (работает на пустом UM-кошельке), сразу отменяется. Размер крупный только для замера — на латентность place/cancel размер НЕ влияет. balance-guard откажет, если на счёте > MAX_EQUITY_USDT (50). ПРИМЕЧАНИЕ: на этом счёте включён Portfolio Margin, поэтому условные идут через papi POST /papi/v1/um/conditional/order (обычный /fapi/v1/order даёт -4120). WS для PM-условных недоступен (у papi нет WS API). Бенчмарк: --conditional --exchange binance --market futures.",
 
-    "auto_price": true,
+    "auto_price": false,
     "auto_size": false,
 
     "futures": {
         "base_url": "https://fapi.binance.com",
         "ws_url": "wss://ws-fapi.binance.com/ws-fapi/v1",
+        "pm": true,
+        "pm_base_url": "https://papi.binance.com",
 
         "symbol": "BTCUSDT",
         "side": "BUY",
-        "type": "STOP",
+        "type": "STOP_MARKET",
         "stop_price": "1000000",
         "working_type": "MARK_PRICE",
-        "price": "20000",
-        "time_in_force": "GTC",
         "quantity": "100",
         "recv_window": 5000,
         "timeout_sec": 10
