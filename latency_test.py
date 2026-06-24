@@ -189,26 +189,29 @@ def binance_order_params(cfg, is_futures, cl):
     return params
 
 
-def binance_pm_conditional_params(cfg, cl):
-    """Параметры УСЛОВНОГО ордера для Portfolio Margin (papi):
-    POST /papi/v1/um/conditional/order. Отличается от обычного /fapi/v1/order:
-    тип идёт в strategyType, клиентский id — в newClientStrategyId. Лимитные
-    условные (STOP/TAKE_PROFIT) добавляют price+timeInForce, рыночные (*_MARKET)
-    — нет. stopPrice обязателен."""
+def binance_algo_conditional_params(cfg, cl):
+    """Параметры УСЛОВНОГО ордера для нового Algo-эндпоинта Binance Futures
+    (POST /fapi/v1/algoOrder). С 2025-12-09 условные типы (STOP_MARKET, STOP,
+    TAKE_PROFIT_MARKET, TAKE_PROFIT, TRAILING_STOP_MARKET) на /fapi/v1/order
+    отклоняются (-4120) и должны идти сюда. Имена полей отличаются от обычного
+    ордера: type→orderType, stopPrice→triggerPrice, newClientOrderId→clientAlgoId,
+    плюс обязательный algoType=CONDITIONAL. Лимитные условные (STOP/TAKE_PROFIT)
+    добавляют price+timeInForce, рыночные (*_MARKET) — нет."""
     otype = str(cfg.get("type", "STOP_MARKET")).upper()
     allowed = LIMIT_CONDITIONAL_TYPES | MARKET_CONDITIONAL_TYPES
     if otype not in allowed:
         raise RuntimeError(
-            f"PM conditional: тип '{otype}' не условный; допустимо: {sorted(allowed)}")
+            f"algo conditional: тип '{otype}' не условный; допустимо: {sorted(allowed)}")
     params = {
+        "algoType": "CONDITIONAL",
         "symbol": cfg["symbol"],
         "side": cfg.get("side", "BUY"),
-        "strategyType": otype,
+        "orderType": otype,
         "quantity": cfg["quantity"],
-        "newClientStrategyId": cl,
-        "stopPrice": cfg["stop_price"],
+        "triggerPrice": cfg["stop_price"],
+        "clientAlgoId": cl,
     }
-    if otype in LIMIT_CONDITIONAL_TYPES:            # лимитные условные
+    if otype in LIMIT_CONDITIONAL_TYPES:            # лимитные условные: цена + TIF
         params["price"] = cfg["price"]
         params["timeInForce"] = cfg.get("time_in_force", "GTC")
     if cfg.get("working_type"):
@@ -233,11 +236,10 @@ class BinanceRest:
         self.symbol = cfg["symbol"]
         self.path = "/fapi/v1/order" if self.is_futures else "/api/v3/order"
         self.open_path = "/fapi/v1/openOrders" if self.is_futures else "/api/v3/openOrders"
-        # Portfolio Margin: условные ордера идут через отдельный хост papi
-        # (обычный /fapi/v1/order их отклоняет с -4120). Рыночные данные/время
-        # при этом остаются на base (fapi) — на papi их нет.
-        self.pm = bool(cfg.get("pm"))
-        self.pm_base = cfg.get("pm_base_url", "https://papi.binance.com").rstrip("/")
+        # С 2025-12-09 условные (trigger) ордера USDⓈ-M futures идут через
+        # отдельный Algo-эндпоинт /fapi/v1/algoOrder (тот же хост fapi, другой
+        # путь и имена полей). Обычный /fapi/v1/order их отклоняет с -4120.
+        self.algo = self.is_futures and is_conditional(cfg)
         self.session = requests.Session()
         self.session.headers.update({"X-MBX-APIKEY": self.key})
 
@@ -250,35 +252,26 @@ class BinanceRest:
         return self._signed_path(method, self.path, params)
 
     def _signed_path(self, method, path, params):
-        return self._signed_on(self.base, method, path, params)
-
-    def _signed_pm(self, method, path, params):
-        """Подписанный запрос к papi (Portfolio Margin)."""
-        return self._signed_on(self.pm_base, method, path, params)
-
-    def _signed_on(self, base, method, path, params):
         params = dict(params)
         params["timestamp"] = now_ms()
         params["recvWindow"] = self.cfg.get("recv_window", 5000)
-        url = f"{base}{path}?{self._sign(params)}"
+        url = f"{self.base}{path}?{self._sign(params)}"
         r = self.session.request(method, url, timeout=self.timeout)
-        tag = "PM API" if base == self.pm_base else "API"
         try:                                        # пустой/не-JSON ответ → понятная ошибка
             data = r.json()
         except ValueError:
             raise RuntimeError(
-                f"Binance {tag} {r.status_code}: не-JSON ответ {r.text[:200]!r}")
+                f"Binance API {r.status_code}: не-JSON ответ {r.text[:200]!r}")
         if r.status_code != 200:
-            raise RuntimeError(f"Binance {tag} {r.status_code}: {data}")
+            raise RuntimeError(f"Binance API {r.status_code}: {data}")
         return data
 
     def place_order(self):
         cl = gen_cl_id()
-        if self.pm:                                 # Portfolio Margin: условный через papi
-            data = self._signed_pm(
-                "POST", "/papi/v1/um/conditional/order",
-                binance_pm_conditional_params(self.cfg, cl))
-            if data.get("strategyStatus") not in ("NEW", "WORKING", "TRIGGERED"):
+        if self.algo:                               # условный → новый Algo-эндпоинт
+            data = self._signed_path("POST", "/fapi/v1/algoOrder",
+                                     binance_algo_conditional_params(self.cfg, cl))
+            if data.get("algoStatus") not in ("NEW", "WORKING", "TRIGGERED"):
                 raise RuntimeError(f"условный ордер не размещён: {data}")
             return cl
         data = self._signed("POST", binance_order_params(self.cfg, self.is_futures, cl))
@@ -288,21 +281,11 @@ class BinanceRest:
 
     def dual_side_position(self):
         """True, если фьючерсный счёт в режиме хеджирования (dual-side)."""
-        if self.pm:
-            data = self._signed_pm("GET", "/papi/v1/um/positionSide/dual", {})
-        else:
-            data = self._signed_path("GET", "/fapi/v1/positionSide/dual", {})
+        data = self._signed_path("GET", "/fapi/v1/positionSide/dual", {})
         return bool(data.get("dualSidePosition", False))
 
     def available_usdt(self):
         """Свободный баланс USDT (для balance-guard перед условным ордером)."""
-        if self.pm:                                 # Portfolio Margin: баланс на papi
-            data = self._signed_pm("GET", "/papi/v1/balance", {})
-            for b in data:
-                if b.get("asset") == "USDT":
-                    return float(b.get("crossMarginFree",
-                                       b.get("totalWalletBalance", 0)) or 0)
-            return 0.0
         if self.is_futures:
             data = self._signed_path("GET", "/fapi/v2/balance", {})
             for b in data:
@@ -316,11 +299,12 @@ class BinanceRest:
         return 0.0
 
     def cancel_order(self, cl):
-        if self.pm:                                 # Portfolio Margin: отмена условного на papi
-            data = self._signed_pm(
-                "DELETE", "/papi/v1/um/conditional/order",
-                {"symbol": self.cfg["symbol"], "newClientStrategyId": cl})
-            if data.get("strategyStatus") != "CANCELED":
+        if self.algo:                               # условный → отмена на Algo-эндпоинте
+            data = self._signed_path(
+                "DELETE", "/fapi/v1/algoOrder",
+                {"symbol": self.cfg["symbol"], "clientAlgoId": cl})
+            st = data.get("algoStatus")
+            if st is not None and st != "CANCELED":
                 raise RuntimeError(f"условный ордер не отменён: {data}")
             return
         data = self._signed("DELETE", {"symbol": self.cfg["symbol"], "origClientOrderId": cl})
@@ -328,15 +312,11 @@ class BinanceRest:
             raise RuntimeError(f"ордер не отменён: {data}")
 
     def list_open(self):
-        if self.pm:
-            return self._signed_pm("GET", "/papi/v1/um/conditional/openOrders",
-                                   {"symbol": self.symbol})
+        if self.algo:
+            return self._signed_path("GET", "/fapi/v1/openAlgoOrders", {"symbol": self.symbol})
         return self._signed_path("GET", self.open_path, {"symbol": self.symbol})
 
     def position_amt(self):
-        if self.pm:
-            data = self._signed_pm("GET", "/papi/v1/um/positionRisk", {"symbol": self.symbol})
-            return sum(float(p.get("positionAmt", 0) or 0) for p in data)
         if not self.is_futures:
             return 0.0
         data = self._signed_path("GET", "/fapi/v2/positionRisk", {"symbol": self.symbol})
@@ -344,17 +324,17 @@ class BinanceRest:
 
     def reconcile(self):
         # Снимаем ТОЛЬКО свои ордера (id с префиксом "lt"), чужие по символу не
-        # трогаем. В PM клиентский id лежит в newClientStrategyId. Возвращаем
+        # трогаем. У algo-ордеров клиентский id лежит в clientAlgoId. Возвращаем
         # (снято, осталось, позиция).
-        id_field = "newClientStrategyId" if self.pm else "clientOrderId"
+        id_field = "clientAlgoId" if self.algo else "clientOrderId"
         ours = [o for o in self.list_open()
                 if str(o.get(id_field, "")).startswith("lt")]
         for o in ours:
             try:
-                if self.pm:
-                    self._signed_pm("DELETE", "/papi/v1/um/conditional/order",
-                                    {"symbol": self.symbol,
-                                     "newClientStrategyId": o[id_field]})
+                if self.algo:
+                    self._signed_path("DELETE", "/fapi/v1/algoOrder",
+                                      {"symbol": self.symbol,
+                                       "clientAlgoId": o[id_field]})
                 else:
                     self._signed_path("DELETE", self.path,
                                       {"symbol": self.symbol,
@@ -1062,10 +1042,11 @@ def run_binance(market, transport):
     if transport == "API":
         c = BinanceRest(cfg, market)
         return measure(c.place_order, c.cancel_order)
-    if cfg.get("pm") and is_conditional(cfg):
-        # У Portfolio Margin (papi) нет WS API — условные ордера только REST.
-        raise RuntimeError("Portfolio Margin: условные ордера только через REST "
-                           "(у papi нет WS API)")
+    if market == "futures" and is_conditional(cfg):
+        # Условные ордера USDⓈ-M futures с 2025-12-09 идут через Algo REST
+        # (/fapi/v1/algoOrder); WS API их не принимает (order.place даёт -4120).
+        raise RuntimeError("Условные ордера Binance Futures с 2025-12-09 — только "
+                           "через Algo REST (/fapi/v1/algoOrder), WS API не поддерживает")
     return measure_ws(BinanceWs(cfg, market))
 
 
