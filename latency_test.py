@@ -262,9 +262,13 @@ class BinanceRest:
         params["recvWindow"] = self.cfg.get("recv_window", 5000)
         url = f"{base}{path}?{self._sign(params)}"
         r = self.session.request(method, url, timeout=self.timeout)
-        data = r.json()
+        tag = "PM API" if base == self.pm_base else "API"
+        try:                                        # пустой/не-JSON ответ → понятная ошибка
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(
+                f"Binance {tag} {r.status_code}: не-JSON ответ {r.text[:200]!r}")
         if r.status_code != 200:
-            tag = "PM API" if base == self.pm_base else "API"
             raise RuntimeError(f"Binance {tag} {r.status_code}: {data}")
         return data
 
