@@ -89,6 +89,7 @@ load_env_file()
 # Пути к конфигам можно переопределить через окружение/.env.
 CONFIG_BINANCE = os.environ.get("CONFIG_BINANCE", "config_binance_PROD.json")
 CONFIG_OKX = os.environ.get("CONFIG_OKX", "config_okx_PROD.json")
+CONFIG_MEXC = os.environ.get("CONFIG_MEXC", "config_mexc_PROD.json")
 # Отдельный конфиг для условного (trigger) бенчмарка Binance — включается флагом
 # --conditional / CONDITIONAL=1. Держим его отдельным файлом, чтобы обычный прогон
 # по умолчанию оставался безопасным лимитным, а «заряженный» конфиг был явным opt-in.
@@ -96,6 +97,8 @@ CONFIG_BINANCE_CONDITIONAL = os.environ.get(
     "CONFIG_BINANCE_CONDITIONAL", "config_binance_PROD_conditional.json")
 CONFIG_OKX_CONDITIONAL = os.environ.get(
     "CONFIG_OKX_CONDITIONAL", "config_okx_PROD_conditional.json")
+CONFIG_MEXC_CONDITIONAL = os.environ.get(
+    "CONFIG_MEXC_CONDITIONAL", "config_mexc_PROD_conditional.json")
 
 
 def _require_env(name):
@@ -131,6 +134,10 @@ def okx_credentials():
         _require_env("OKX_API_SECRET"),
         _require_env("OKX_API_PASSPHRASE"),
     )
+
+
+def mexc_credentials():
+    return _require_env("MEXC_API_KEY"), _require_env("MEXC_API_SECRET")
 
 
 def load_config(path):
@@ -660,6 +667,183 @@ class OkxWs:
 
 
 # =========================================================================== #
+#                              MEXC (REST)                                    #
+# =========================================================================== #
+# MEXC — две РАЗНЫЕ системы: спот (api.mexc.com, Binance-совместимый /api/v3) и
+# контракты (contract.mexc.com, своя подпись ApiKey+Request-Time+Signature).
+# ВАЖНО: фьючерсный order-API MEXC (и обычный order/submit, и trigger
+# planorder/place) уже давно «Under maintenance» — для обычных аккаунтов
+# вернёт code 500. Условные ордера у MEXC есть ТОЛЬКО на фьючерсах, поэтому
+# условный бенчмарк MEXC доступен лишь как попытка (документируем maintenance).
+# Спот же работает: лимитный ордер даёт реальные числа.
+MEXC_SPOT_BASE = "https://api.mexc.com"
+MEXC_CONTRACT_BASE = "https://contract.mexc.com"
+
+
+def mexc_contract_params(cfg, cl):
+    """Тело контрактного ордера MEXC. side: 1 open long / 3 open short. type:
+    1 limit … 5 market. Для trigger добавляются triggerPrice/triggerType/trend/
+    executeCycle/orderType и запрос идёт на planorder/place."""
+    side = str(cfg.get("side", "buy")).lower()
+    otype = int(cfg.get("type", 1))
+    body = {
+        "symbol": cfg["symbol"],                     # формат BTC_USDT
+        "vol": float(cfg["size"]),
+        "side": 1 if side.startswith("b") else 3,    # 1 open long, 3 open short
+        "type": otype,                               # 1 limit … 5 market
+        "openType": int(cfg.get("open_type", 2)),    # 1 isolated, 2 cross
+        "externalOid": cl,
+    }
+    if otype not in (5, 6):                          # лимитным нужна цена
+        body["price"] = float(cfg["price"])
+    if cfg.get("trigger_price"):                     # trigger → planorder/place
+        body["triggerPrice"] = float(cfg["trigger_price"])
+        body["triggerType"] = int(cfg.get("trigger_type", 1))   # 1 >=, 2 <=
+        body["executeCycle"] = int(cfg.get("execute_cycle", 1))  # 1 24h, 2 7d
+        body["trend"] = int(cfg.get("trend", 1))                 # 1 last,2 fair,3 index
+        body["orderType"] = int(cfg.get("order_type", 1))        # тип при срабатывании
+    return body
+
+
+class MexcRest:
+    def __init__(self, cfg, market):
+        self.cfg = cfg
+        self.market = market
+        self.is_futures = market == "futures"
+        self.key = cfg["api_key"]
+        self.secret = cfg["api_secret"].encode()
+        self.timeout = cfg.get("timeout_sec", 10)
+        self.symbol = cfg["symbol"]
+        # условный = фьючерс с триггером (на споте MEXC триггеров нет)
+        self.algo = self.is_futures and bool(cfg.get("trigger_price"))
+        self.session = requests.Session()
+
+    # ---- спот: api.mexc.com, подпись как у Binance ----
+    def _spot(self, method, path, params):
+        params = dict(params)
+        params["timestamp"] = now_ms()
+        params["recvWindow"] = self.cfg.get("recv_window", 5000)
+        query = urlencode(params)
+        sig = hmac.new(self.secret, query.encode(), hashlib.sha256).hexdigest()
+        url = f"{MEXC_SPOT_BASE}{path}?{query}&signature={sig}"
+        r = self.session.request(method, url, headers={"X-MEXC-APIKEY": self.key},
+                                 timeout=self.timeout)
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"MEXC spot {r.status_code}: не-JSON {r.text[:200]!r}")
+        if r.status_code != 200:
+            raise RuntimeError(f"MEXC spot {r.status_code}: {data}")
+        return data
+
+    # ---- контракты: contract.mexc.com, подпись ApiKey+ts+body ----
+    def _contract(self, method, path, body=None, query=None):
+        ts = str(now_ms())
+        headers = {"ApiKey": self.key, "Request-Time": ts,
+                   "Content-Type": "application/json"}
+        if method == "GET":
+            qs = urlencode(dict(sorted((query or {}).items())))
+            headers["Signature"] = hmac.new(
+                self.secret, (self.key + ts + qs).encode(), hashlib.sha256).hexdigest()
+            url = f"{MEXC_CONTRACT_BASE}{path}" + (f"?{qs}" if qs else "")
+            r = self.session.get(url, headers=headers, timeout=self.timeout)
+        else:
+            body_str = json.dumps(body if body is not None else {})
+            headers["Signature"] = hmac.new(
+                self.secret, (self.key + ts + body_str).encode(), hashlib.sha256).hexdigest()
+            r = self.session.request(method, f"{MEXC_CONTRACT_BASE}{path}",
+                                     data=body_str, headers=headers, timeout=self.timeout)
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"MEXC contract {r.status_code}: не-JSON {r.text[:200]!r}")
+        if data.get("code") not in (0, 200):        # 500 = Under maintenance
+            raise RuntimeError(f"MEXC contract code={data.get('code')}: "
+                               f"{data.get('message') or data}")
+        return data
+
+    def place_order(self):
+        cl = gen_cl_id()
+        if not self.is_futures:                      # СПОТ (лимит)
+            data = self._spot("POST", "/api/v3/order", {
+                "symbol": self.symbol, "side": str(self.cfg.get("side", "BUY")).upper(),
+                "type": "LIMIT", "quantity": self.cfg["size"],
+                "price": self.cfg["price"], "newClientOrderId": cl,
+            })
+            if not data.get("orderId"):
+                raise RuntimeError(f"ордер не размещён: {data}")
+            return cl                                # отмена по clientOrderId
+        path = "/api/v1/private/planorder/place" if self.algo else "/api/v1/private/order/submit"
+        data = self._contract("POST", path, mexc_contract_params(self.cfg, cl))
+        oid = data.get("data")
+        if not oid:
+            raise RuntimeError(f"ордер не размещён: {data}")
+        return oid                                   # отмена по orderId
+
+    def cancel_order(self, oid):
+        if not self.is_futures:                      # СПОТ
+            self._spot("DELETE", "/api/v3/order",
+                       {"symbol": self.symbol, "origClientOrderId": oid})
+            return
+        if self.algo:
+            self._contract("POST", "/api/v1/private/planorder/cancel",
+                           [{"symbol": self.symbol, "orderId": oid}])
+        else:
+            self._contract("POST", "/api/v1/private/order/cancel", [oid])
+
+    def available_usdt(self):
+        if not self.is_futures:
+            data = self._spot("GET", "/api/v3/account", {})
+            for b in data.get("balances", []):
+                if b.get("asset") == "USDT":
+                    return float(b.get("free", 0) or 0)
+            return 0.0
+        data = self._contract("GET", "/api/v1/private/account/asset/USDT")
+        d = data.get("data") or {}
+        return float(d.get("availableBalance", d.get("availableMargin", 0)) or 0)
+
+    def list_open(self):
+        if not self.is_futures:
+            return self._spot("GET", "/api/v3/openOrders", {"symbol": self.symbol})
+        if self.algo:
+            d = self._contract("GET", "/api/v1/private/planorder/list/orders",
+                               query={"symbol": self.symbol})
+        else:
+            d = self._contract("GET", f"/api/v1/private/order/list/open_orders/{self.symbol}")
+        return d.get("data") or []
+
+    def position_amt(self):
+        if not self.is_futures:
+            return 0.0
+        try:
+            d = self._contract("GET", "/api/v1/private/position/open_positions",
+                               query={"symbol": self.symbol})
+            return sum(float(p.get("holdVol", 0) or 0) for p in (d.get("data") or []))
+        except Exception:
+            return 0.0
+
+    def reconcile(self):
+        id_field = "externalOid" if self.is_futures else "clientOrderId"
+        try:
+            ours = [o for o in self.list_open()
+                    if str(o.get(id_field, "")).startswith("lt")]
+        except Exception:
+            ours = []
+        for o in ours:
+            try:
+                self.cancel_order(o.get("orderId") if self.is_futures
+                                  else o.get("clientOrderId"))
+            except Exception:
+                pass
+        try:
+            left = [o for o in self.list_open()
+                    if str(o.get(id_field, "")).startswith("lt")]
+        except Exception:
+            left = []
+        return len(ours), len(left), self.position_amt()
+
+
+# =========================================================================== #
 #               Авто-цена: безопасный неисполняемый лимит                     #
 # =========================================================================== #
 # Идея: вместо ручной подгонки "price" в конфиге считаем цену от текущего
@@ -942,9 +1126,21 @@ def balance_guard(cfg, market, exch="Binance"):
     ceil = max_equity_usdt()
     fresh = key not in _guard_cache
     if fresh:
-        client = BinanceRest(cfg, market) if exch == "Binance" else OkxRest(cfg)
-        _guard_cache[key] = client.available_usdt()
+        if exch == "Binance":
+            client = BinanceRest(cfg, market)
+        elif exch == "OKX":
+            client = OkxRest(cfg)
+        else:
+            client = MexcRest(cfg, market)
+        try:
+            _guard_cache[key] = client.available_usdt()
+        except Exception as e:                      # баланс не прочитать (напр. maintenance)
+            print(f"  [balance-guard] {exch} {market}: не удалось прочитать баланс "
+                  f"({e}) — пропускаю (триггер всё равно недостижим)")
+            _guard_cache[key] = None
     avail = _guard_cache[key]
+    if avail is None:                               # fail-open: читать нечем
+        return
     if avail > ceil:
         size = cfg.get("quantity") or cfg.get("size")
         inst = cfg.get("symbol") or cfg.get("inst_id")
@@ -1021,6 +1217,9 @@ def server_time_ms(exch, base, is_futures, simulated, timeout):
         path = "/fapi/v1/time" if is_futures else "/api/v3/time"
         d = requests.get(base + path, timeout=timeout).json()
         return int(d["serverTime"])
+    if exch == "mexc":                               # сверяем по споту (api.mexc.com)
+        d = requests.get(MEXC_SPOT_BASE + "/api/v3/time", timeout=timeout).json()
+        return int(d["serverTime"])
     headers = {"x-simulated-trading": "1"} if simulated else {}
     d = requests.get(base + "/api/v5/public/time", headers=headers, timeout=timeout).json()
     return int(d["data"][0]["ts"])
@@ -1038,9 +1237,10 @@ def time_sync_preflight(markets):
             continue
         seen.add(exch)
         try:
-            cfg = binance_cfg(market) if exch == "binance" else okx_cfg(market)
+            cfg = {"binance": binance_cfg, "okx": okx_cfg,
+                   "mexc": mexc_cfg}[exch](market)
             t0 = now_ms()
-            srv = server_time_ms(exch, cfg["base_url"], market == "futures",
+            srv = server_time_ms(exch, cfg.get("base_url", ""), market == "futures",
                                  cfg.get("simulated", False), cfg.get("timeout_sec", 10))
             t1 = now_ms()
             offset = srv - (t0 + t1) // 2
@@ -1136,6 +1336,15 @@ def okx_cfg(market):
     return cfg
 
 
+def mexc_cfg(market):
+    full = load_config(CONFIG_MEXC_CONDITIONAL if conditional_on() else CONFIG_MEXC)
+    shared = {k: full[k] for k in ("timeout_sec", "auto_price", "price_offset_pct",
+                                   "auto_size") if k in full}
+    cfg = {**shared, **full[market]}
+    cfg["api_key"], cfg["api_secret"] = mexc_credentials()
+    return cfg
+
+
 def run_binance(market, transport):
     cfg = binance_cfg(market)
     if is_conditional(cfg) and balance_guard_on():
@@ -1191,15 +1400,46 @@ def run_okx(market, transport):
     return measure_ws(OkxWs(cfg))
 
 
+def mexc_safe_price(cfg, offset):
+    """Безопасная неисполняемая цена для MEXC спота: BUY ниже лучшего бида на
+    offset%, SELL выше лучшего аска. Берём из bookTicker (api.mexc.com)."""
+    r = requests.get(MEXC_SPOT_BASE + "/api/v3/ticker/bookTicker",
+                     params={"symbol": cfg["symbol"]}, timeout=cfg.get("timeout_sec", 10))
+    d = r.json()
+    bid, ask = float(d["bidPrice"]), float(d["askPrice"])
+    side = str(cfg.get("side", "BUY")).upper()
+    px = bid * (1 - offset / 100.0) if side.startswith("B") else ask * (1 + offset / 100.0)
+    return f"{px:.2f}"
+
+
+def run_mexc(market, transport):
+    cfg = mexc_cfg(market)
+    if market == "futures" and bool(cfg.get("trigger_price")) and balance_guard_on():
+        balance_guard(cfg, market, "MEXC")
+    if market == "spot" and auto_price_on(cfg):     # спот: цена от рынка (в коридоре)
+        cfg["price"] = _auto_price(
+            ("MEXC", market), lambda: mexc_safe_price(cfg, price_offset(cfg)))
+    if transport != "API":
+        # У MEXC нет WS-API размещения ордеров (WS — только маркет-дата и
+        # user-data стримы). Замер place/cancel — только REST.
+        raise RuntimeError("MEXC: размещение ордеров только через REST "
+                           "(WS-API ордеров у MEXC нет)")
+    c = MexcRest(cfg, market)
+    return measure(c.place_order, c.cancel_order)
+
+
 def reconcile_market(exch, market):
     """Защитная зачистка после прогона: снимаем свои висячие ордера и
     проверяем позицию (на случай reject/таймаута/частичного исполнения)."""
     if exch == "binance":
         c = BinanceRest(binance_cfg(market), market)
         label = f"Binance {market}"
-    else:
+    elif exch == "okx":
         c = OkxRest(okx_cfg(market))
         label = f"OKX {market}"
+    else:
+        c = MexcRest(mexc_cfg(market), market)
+        label = f"MEXC {market}"
     cancelled, left, pos = c.reconcile()
     note = f"снято наших={cancelled}, осталось={left}, позиция={pos:g}"
     if left or abs(pos) > 1e-12:
@@ -1213,6 +1453,8 @@ ALL_MARKETS = [
     ("Binance Spot",    run_binance, "spot",    "binance"),
     ("OKX Futures",     run_okx,     "futures", "okx"),
     ("OKX Spot",        run_okx,     "spot",    "okx"),
+    ("MEXC Futures",    run_mexc,    "futures", "mexc"),
+    ("MEXC Spot",       run_mexc,    "spot",    "mexc"),
 ]
 
 
@@ -1301,7 +1543,7 @@ def main():
     markets = select_markets(exch, mkt)
     if not markets:
         print(f"Нет рынков под фильтр exchange={exch} market={mkt}.")
-        print("Допустимо: --exchange both|binance|okx, --market both|spot|futures")
+        print("Допустимо: --exchange both|binance|okx|mexc, --market both|spot|futures")
         return
 
     confirm_live(skip_confirm)

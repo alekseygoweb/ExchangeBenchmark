@@ -1,0 +1,32 @@
+{
+    "name": "MEXC (PROD) — УСЛОВНЫЙ (trigger) бенчмарк",
+    "_comment": "Включается флагом --conditional / CONDITIONAL=1. Ключи из .env (MEXC_API_KEY / MEXC_API_SECRET).",
+    "_safety": "BUY trigger (planorder) с НЕДОСТИЖИМЫМ triggerPrice=10000000 и triggerType=1 (>=): сработал бы только при росте цены до 10 000 000, то есть никогда. ВАЖНО: фьючерсный order-API MEXC (и обычный, и trigger planorder/place) — под maintenance, для обычных аккаунтов вернёт code 500 'Under maintenance'. Это попытка/документирование блока; если у аккаунта есть доступ к contract API — разместит и сразу отменит. balance-guard читает баланс контрактного кошелька (fail-open при ошибке). У MEXC нет WS-API ордеров — только REST. Условных ордеров на споте MEXC нет. Бенчмарк: --conditional --exchange mexc --market futures.",
+
+    "timeout_sec": 10,
+    "auto_price": true,
+    "price_offset_pct": 1.0,
+    "auto_size": false,
+
+    "futures": {
+        "symbol": "BTC_USDT",
+        "side": "buy",
+        "type": 1,
+        "price": "20000",
+        "size": "100",
+        "open_type": 2,
+        "trigger_price": "10000000",
+        "trigger_type": 1,
+        "trend": 1,
+        "execute_cycle": 1,
+        "order_type": 1
+    },
+
+    "spot": {
+        "_comment": "У MEXC нет trigger-ордеров на споте — здесь обычный лимит (fallback). Условный бенчмарк MEXC рассчитан на --market futures.",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "price": "20000",
+        "size": "0.0001"
+    }
+}

@@ -1,0 +1,26 @@
+{
+    "name": "MEXC (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи из .env (MEXC_API_KEY / MEXC_API_SECRET). СПОТ работает (api.mexc.com, Binance-совместимый). ФЬЮЧЕРСНЫЙ order-API MEXC (contract.mexc.com) — под maintenance, вернёт code 500. У MEXC нет WS-API размещения ордеров — замер только REST.",
+
+    "timeout_sec": 10,
+    "auto_price": true,
+    "price_offset_pct": 1.0,
+    "auto_size": false,
+
+    "futures": {
+        "_comment": "MEXC contract order/submit под maintenance — ожидается code 500 'Under maintenance'. side: buy→1 (open long). type 1=limit.",
+        "symbol": "BTC_USDT",
+        "side": "buy",
+        "type": 1,
+        "price": "20000",
+        "size": "1",
+        "open_type": 2
+    },
+
+    "spot": {
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "price": "20000",
+        "size": "0.0001"
+    }
+}
