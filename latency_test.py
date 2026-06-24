@@ -193,32 +193,19 @@ def binance_algo_conditional_params(cfg, cl):
     """Параметры УСЛОВНОГО ордера для нового Algo-эндпоинта Binance Futures
     (POST /fapi/v1/algoOrder). С 2025-12-09 условные типы (STOP_MARKET, STOP,
     TAKE_PROFIT_MARKET, TAKE_PROFIT, TRAILING_STOP_MARKET) на /fapi/v1/order
-    отклоняются (-4120) и должны идти сюда. Имена полей отличаются от обычного
-    ордера: type→orderType, stopPrice→triggerPrice, newClientOrderId→clientAlgoId,
-    плюс обязательный algoType=CONDITIONAL. Лимитные условные (STOP/TAKE_PROFIT)
-    добавляют price+timeInForce, рыночные (*_MARKET) — нет."""
+    отклоняются (-4120) и должны идти сюда.
+
+    ВАЖНО: тело запроса использует ТЕ ЖЕ имена полей, что и обычный ордер
+    (type, stopPrice, newClientOrderId, workingType, positionSide, а для
+    лимитных условных — price+timeInForce), плюс обязательный
+    algoType=CONDITIONAL. Имена algoId/clientAlgoId/orderType/triggerPrice/
+    algoStatus встречаются только в ОТВЕТЕ (сверено с реализацией ccxt)."""
     otype = str(cfg.get("type", "STOP_MARKET")).upper()
-    allowed = LIMIT_CONDITIONAL_TYPES | MARKET_CONDITIONAL_TYPES
-    if otype not in allowed:
-        raise RuntimeError(
-            f"algo conditional: тип '{otype}' не условный; допустимо: {sorted(allowed)}")
-    params = {
-        "algoType": "CONDITIONAL",
-        "symbol": cfg["symbol"],
-        "side": cfg.get("side", "BUY"),
-        "orderType": otype,
-        "quantity": cfg["quantity"],
-        "triggerPrice": cfg["stop_price"],
-        "clientAlgoId": cl,
-    }
-    if otype in LIMIT_CONDITIONAL_TYPES:            # лимитные условные: цена + TIF
-        params["price"] = cfg["price"]
-        params["timeInForce"] = cfg.get("time_in_force", "GTC")
-    if cfg.get("working_type"):
-        params["workingType"] = cfg["working_type"]
-    if cfg.get("position_side"):                    # hedge-режим: LONG/SHORT
-        params["positionSide"] = cfg["position_side"]
-    return params
+    if otype not in (LIMIT_CONDITIONAL_TYPES | MARKET_CONDITIONAL_TYPES):
+        raise RuntimeError(f"algo conditional: тип '{otype}' не условный")
+    # Обычный конструктор даёт type/stopPrice/newClientOrderId/workingType/
+    # positionSide/quantity/side/(price,timeInForce). Добавляем algoType.
+    return {"algoType": "CONDITIONAL", **binance_order_params(cfg, True, cl)}
 
 
 # =========================================================================== #
@@ -303,8 +290,12 @@ class BinanceRest:
             data = self._signed_path(
                 "DELETE", "/fapi/v1/algoOrder",
                 {"symbol": self.cfg["symbol"], "clientAlgoId": cl})
+            # Ответ отмены — {algoId, clientAlgoId, code:"200", msg:"success"}
+            # (без algoStatus). Успех: code 200 / msg success / algoStatus CANCELED.
+            code = str(data.get("code")) if data.get("code") is not None else None
             st = data.get("algoStatus")
-            if st is not None and st != "CANCELED":
+            ok = (code in (None, "200")) and (st in (None, "CANCELED"))
+            if not ok and data.get("msg") != "success":
                 raise RuntimeError(f"условный ордер не отменён: {data}")
             return
         data = self._signed("DELETE", {"symbol": self.cfg["symbol"], "origClientOrderId": cl})
