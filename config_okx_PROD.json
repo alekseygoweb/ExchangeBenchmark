@@ -7,9 +7,9 @@
     "simulated": false,
     "timeout_sec": 10,
 
-    "auto_price": false,
+    "auto_price": true,
     "price_offset_pct": 1.0,
-    "auto_size": false,
+    "auto_size": true,
 
     "futures": {
         "inst_id": "BTC-USDT-SWAP",

@@ -1402,25 +1402,52 @@ def run_okx(market, transport):
     return measure_ws(OkxWs(cfg))
 
 
-def mexc_safe_price(cfg, offset):
-    """Безопасная неисполняемая цена для MEXC спота: BUY ниже лучшего бида на
-    offset%, SELL выше лучшего аска. Берём из bookTicker (api.mexc.com)."""
-    r = requests.get(MEXC_SPOT_BASE + "/api/v3/ticker/bookTicker",
-                     params={"symbol": cfg["symbol"]}, timeout=cfg.get("timeout_sec", 10))
-    d = r.json()
-    bid, ask = float(d["bidPrice"]), float(d["askPrice"])
-    side = str(cfg.get("side", "BUY")).upper()
-    px = bid * (1 - offset / 100.0) if side.startswith("B") else ask * (1 + offset / 100.0)
-    return f"{px:.2f}"
+def mexc_safe_price(cfg, offset, market):
+    """Безопасная неисполняемая цена MEXC: BUY ниже лучшего бида на offset, SELL
+    выше лучшего аска. Спот — bookTicker, фьючерс — contract/ticker (bid1/ask1).
+    offset уже доля (не проценты). Округляем к целому (валидный тик для BTC)."""
+    timeout = cfg.get("timeout_sec", 10)
+    if market == "futures":
+        r = requests.get(MEXC_CONTRACT_BASE + "/api/v1/contract/ticker",
+                         params={"symbol": cfg["symbol"]}, timeout=timeout).json()
+        d = r.get("data") or {}
+        bid, ask = float(d.get("bid1") or 0), float(d.get("ask1") or 0)
+    else:
+        d = requests.get(MEXC_SPOT_BASE + "/api/v3/ticker/bookTicker",
+                         params={"symbol": cfg["symbol"]}, timeout=timeout).json()
+        bid, ask = float(d["bidPrice"]), float(d["askPrice"])
+    return _compute_price(cfg, bid, ask, "1", offset)
+
+
+def mexc_min_order_size(cfg, market):
+    """Минимальный валидный объём MEXC. Фьючерс — contract/detail.minVol (в
+    контрактах). Спот — exchangeInfo: max(baseSizePrecision, минНоминал/цена)."""
+    timeout = cfg.get("timeout_sec", 10)
+    if market == "futures":
+        r = requests.get(MEXC_CONTRACT_BASE + "/api/v1/contract/detail",
+                         params={"symbol": cfg["symbol"]}, timeout=timeout).json()
+        d = r.get("data")
+        if isinstance(d, list):
+            d = next((x for x in d if x.get("symbol") == cfg["symbol"]), d[0])
+        return _okx_min_size(d.get("minVol", "1"), d.get("volUnit", "1") or "1")
+    info = requests.get(MEXC_SPOT_BASE + "/api/v3/exchangeInfo",
+                        params={"symbol": cfg["symbol"]}, timeout=timeout).json()
+    sym = info["symbols"][0]
+    base_step = sym.get("baseSizePrecision") or "0.000001"
+    min_notional = sym.get("quoteAmountPrecision") or "0"
+    return _min_qty_for_notional(float(cfg["price"]), base_step, base_step, min_notional)
 
 
 def run_mexc(market, transport):
     cfg = mexc_cfg(market)
     if market == "futures" and bool(cfg.get("trigger_price")) and balance_guard_on():
         balance_guard(cfg, market, "MEXC")
-    if market == "spot" and auto_price_on(cfg):     # спот: цена от рынка (в коридоре)
+    if auto_price_on(cfg):                           # неисполняемая цена от рынка
         cfg["price"] = _auto_price(
-            ("MEXC", market), lambda: mexc_safe_price(cfg, price_offset(cfg)))
+            ("MEXC", market), lambda: mexc_safe_price(cfg, price_offset(cfg), market))
+    if auto_size_on(cfg):                            # минимальный валидный объём
+        cfg["size"] = _auto_size(
+            ("MEXC", market), lambda: mexc_min_order_size(cfg, market))
     if transport != "API":
         # У MEXC нет WS-API размещения ордеров (WS — только маркет-дата и
         # user-data стримы). Замер place/cancel — только REST.

@@ -2,9 +2,9 @@
     "name": "Binance (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
     "_comment": "Ключи API берутся из .env (BINANCE_API_KEY / BINANCE_API_SECRET), здесь их нет.",
 
-    "auto_price": false,
+    "auto_price": true,
     "price_offset_pct": 1.0,
-    "auto_size": false,
+    "auto_size": true,
 
     "futures": {
         "base_url": "https://fapi.binance.com",

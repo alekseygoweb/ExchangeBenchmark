@@ -5,7 +5,7 @@
     "timeout_sec": 10,
     "auto_price": true,
     "price_offset_pct": 1.0,
-    "auto_size": false,
+    "auto_size": true,
 
     "futures": {
         "_comment": "MEXC contract order/submit под maintenance — ожидается code 500 'Under maintenance'. side: buy→1 (open long). type 1=limit.",
