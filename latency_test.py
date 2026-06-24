@@ -910,6 +910,17 @@ def _compute_price(cfg, best_bid, best_ask, tick, offset):
     return _round_to_tick(raw, tick, is_buy)
 
 
+def _binance_public_get(url, params, timeout):
+    """GET к публичному Binance с понятной ошибкой при гео-блокировке (451)."""
+    r = requests.get(url, params=params, timeout=timeout)
+    if r.status_code == 451:
+        raise RuntimeError("Binance недоступен из этого региона (HTTP 451, "
+                           "гео-ограничение; для США — отдельный binance.us)")
+    if r.status_code != 200:
+        raise RuntimeError(f"Binance API {r.status_code}: {r.text[:160]}")
+    return r.json()
+
+
 def binance_safe_price(cfg, market, offset):
     base = cfg["base_url"].rstrip("/")
     symbol = cfg["symbol"]
@@ -918,15 +929,15 @@ def binance_safe_price(cfg, market, offset):
     book_path = "/fapi/v1/ticker/bookTicker" if is_futures else "/api/v3/ticker/bookTicker"
     info_path = "/fapi/v1/exchangeInfo" if is_futures else "/api/v3/exchangeInfo"
 
-    bt = requests.get(base + book_path, params={"symbol": symbol}, timeout=timeout).json()
+    bt = _binance_public_get(base + book_path, {"symbol": symbol}, timeout)
     best_bid, best_ask = float(bt["bidPrice"]), float(bt["askPrice"])
 
     if is_futures:
         # fapi exchangeInfo отдаёт все символы - фильтруем сами.
-        info = requests.get(base + info_path, timeout=timeout).json()
+        info = _binance_public_get(base + info_path, None, timeout)
         sym = next(s for s in info["symbols"] if s["symbol"] == symbol)
     else:
-        info = requests.get(base + info_path, params={"symbol": symbol}, timeout=timeout).json()
+        info = _binance_public_get(base + info_path, {"symbol": symbol}, timeout)
         sym = info["symbols"][0]
     tick = next(f["tickSize"] for f in sym["filters"] if f["filterType"] == "PRICE_FILTER")
     return _compute_price(cfg, best_bid, best_ask, tick, offset)
@@ -1033,10 +1044,10 @@ def binance_min_order_size(cfg, market):
     is_futures = market == "futures"
     info_path = "/fapi/v1/exchangeInfo" if is_futures else "/api/v3/exchangeInfo"
     if is_futures:
-        info = requests.get(base + info_path, timeout=timeout).json()
+        info = _binance_public_get(base + info_path, None, timeout)
         sym = next(s for s in info["symbols"] if s["symbol"] == symbol)
     else:
-        info = requests.get(base + info_path, params={"symbol": symbol}, timeout=timeout).json()
+        info = _binance_public_get(base + info_path, {"symbol": symbol}, timeout)
         sym = info["symbols"][0]
     filt = {f["filterType"]: f for f in sym["filters"]}
     lot = filt.get("LOT_SIZE", {})
@@ -1221,7 +1232,7 @@ def server_time_ms(exch, base, is_futures, simulated, timeout):
     base = base.rstrip("/")
     if exch == "binance":
         path = "/fapi/v1/time" if is_futures else "/api/v3/time"
-        d = requests.get(base + path, timeout=timeout).json()
+        d = _binance_public_get(base + path, None, timeout)
         return int(d["serverTime"])
     if exch == "mexc":                               # сверяем по споту (api.mexc.com)
         d = requests.get(MEXC_SPOT_BASE + "/api/v3/time", timeout=timeout).json()
