@@ -1,7 +1,7 @@
 {
     "name": "Binance (PROD) — УСЛОВНЫЙ (trigger) бенчмарк",
     "_comment": "Включается флагом --conditional / CONDITIONAL=1. Ключи берутся из .env.",
-    "_safety": "Portfolio Margin (papi): BUY STOP_MARKET с НЕДОСТИЖИМО ВЫСОКИМ триггером (stop_price=1000000) — срабатывает только при росте цены до 1 000 000, то есть никогда. У рыночного условного нет лимитной цены, поэтому нет конфликта с price-фильтром — чистый недостижимый триггер. Маржу не резервирует до срабатывания (работает на пустом UM-кошельке), сразу отменяется. Размер крупный только для замера — на латентность place/cancel размер НЕ влияет. balance-guard откажет, если на счёте > MAX_EQUITY_USDT (50). ПРИМЕЧАНИЕ: на этом счёте включён Portfolio Margin, поэтому условные идут через papi POST /papi/v1/um/conditional/order (обычный /fapi/v1/order даёт -4120). WS для PM-условных недоступен (у papi нет WS API). Бенчмарк: --conditional --exchange binance --market futures.",
+    "_safety": "Классический фьючерсный счёт (PM выключен): BUY STOP_MARKET с НЕДОСТИЖИМО ВЫСОКИМ триггером (stop_price=1000000) — срабатывает только при росте цены до 1 000 000, то есть никогда. У рыночного условного нет лимитной цены, поэтому нет конфликта с price-фильтром. Маржу не резервирует до срабатывания (работает на пустом фьючерсном кошельке), сразу отменяется. Размер крупный только для замера — на латентность place/cancel размер НЕ влияет. balance-guard откажет, если на счёте > MAX_EQUITY_USDT (50). ПРИМЕЧАНИЕ: в режиме Portfolio Margin торговля фьючерсами через API недоступна — поэтому PM выключен, условные идут штатно через /fapi/v1/order. Бенчмарк: --conditional --exchange binance --market futures.",
 
     "auto_price": false,
     "auto_size": false,
@@ -9,8 +9,6 @@
     "futures": {
         "base_url": "https://fapi.binance.com",
         "ws_url": "wss://ws-fapi.binance.com/ws-fapi/v1",
-        "pm": true,
-        "pm_base_url": "https://papi.binance.com",
 
         "symbol": "BTCUSDT",
         "side": "BUY",
