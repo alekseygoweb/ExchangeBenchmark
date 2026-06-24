@@ -1182,10 +1182,12 @@ def run_okx(market, transport):
         c = OkxRest(cfg)
         return measure(c.place_order, c.cancel_order)
     if okx_is_conditional(cfg):
-        # OKX algo-ордера (trigger) размещаются только через REST — WS trade API
-        # их не поддерживает (op order/cancel-order, без order-algo).
-        raise RuntimeError("OKX: условные (trigger) ордера только через REST "
-                           "(WS trade API не поддерживает algo-ордера)")
+        # OKX algo-ордера РАЗМЕЩАЮТСЯ только через REST. WS-канал algo-orders —
+        # это подписка на обновления (push), не размещение; op order-algo в WS
+        # trade API нет (есть только order/batch-orders/cancel-order/amend-order).
+        raise RuntimeError("OKX: algo (trigger) ордера размещаются только через REST "
+                           "(WS-канал algo-orders — подписка на обновления, не "
+                           "размещение; op order-algo в WS trade API отсутствует)")
     return measure_ws(OkxWs(cfg))
 
 
