@@ -211,6 +211,7 @@ def binance_algo_conditional_params(cfg, cl):
         "quantity": cfg["quantity"],
         "triggerPrice": cfg["stop_price"],
         "clientAlgoId": cl,
+        "newOrderRespType": "RESULT",              # иначе дефолт ACK без algoStatus
     }
     if otype in LIMIT_CONDITIONAL_TYPES:            # лимитные условные: цена + TIF
         params["price"] = cfg["price"]
@@ -272,7 +273,11 @@ class BinanceRest:
         if self.algo:                               # условный → новый Algo-эндпоинт
             data = self._signed_path("POST", "/fapi/v1/algoOrder",
                                      binance_algo_conditional_params(self.cfg, cl))
-            if data.get("algoStatus") not in ("NEW", "WORKING", "TRIGGERED"):
+            # Успех: есть серверный algoId ИЛИ algoStatus валиден (на случай
+            # урезанного ACK-ответа без algoStatus). Отмена идёт по нашему cl.
+            ok = (data.get("algoId") is not None
+                  or data.get("algoStatus") in ("NEW", "WORKING", "TRIGGERED"))
+            if not ok:
                 raise RuntimeError(f"условный ордер не размещён: {data}")
             return cl
         data = self._signed("POST", binance_order_params(self.cfg, self.is_futures, cl))
