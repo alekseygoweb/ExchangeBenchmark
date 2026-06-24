@@ -195,17 +195,31 @@ def binance_algo_conditional_params(cfg, cl):
     TAKE_PROFIT_MARKET, TAKE_PROFIT, TRAILING_STOP_MARKET) на /fapi/v1/order
     отклоняются (-4120) и должны идти сюда.
 
-    ВАЖНО: тело запроса использует ТЕ ЖЕ имена полей, что и обычный ордер
-    (type, stopPrice, newClientOrderId, workingType, positionSide, а для
-    лимитных условных — price+timeInForce), плюс обязательный
-    algoType=CONDITIONAL. Имена algoId/clientAlgoId/orderType/triggerPrice/
-    algoStatus встречаются только в ОТВЕТЕ (сверено с реализацией ccxt)."""
+    Имена полей в теле запроса для ЛИНЕЙНОГО бессрочного НЕ-PM ордера — смесь
+    (сверено с ccxt create_order_request): type как у обычного ордера, НО триггер
+    идёт как triggerPrice (не stopPrice), а клиентский id — как clientAlgoId
+    (не newClientOrderId). Плюс обязательный algoType=CONDITIONAL. Лимитные
+    условные (STOP/TAKE_PROFIT) добавляют price+timeInForce, рыночные — нет."""
     otype = str(cfg.get("type", "STOP_MARKET")).upper()
     if otype not in (LIMIT_CONDITIONAL_TYPES | MARKET_CONDITIONAL_TYPES):
         raise RuntimeError(f"algo conditional: тип '{otype}' не условный")
-    # Обычный конструктор даёт type/stopPrice/newClientOrderId/workingType/
-    # positionSide/quantity/side/(price,timeInForce). Добавляем algoType.
-    return {"algoType": "CONDITIONAL", **binance_order_params(cfg, True, cl)}
+    params = {
+        "algoType": "CONDITIONAL",
+        "symbol": cfg["symbol"],
+        "side": cfg.get("side", "BUY"),
+        "type": otype,
+        "quantity": cfg["quantity"],
+        "triggerPrice": cfg["stop_price"],
+        "clientAlgoId": cl,
+    }
+    if otype in LIMIT_CONDITIONAL_TYPES:            # лимитные условные: цена + TIF
+        params["price"] = cfg["price"]
+        params["timeInForce"] = cfg.get("time_in_force", "GTC")
+    if cfg.get("working_type"):
+        params["workingType"] = cfg["working_type"]
+    if cfg.get("position_side"):                    # hedge-режим: LONG/SHORT
+        params["positionSide"] = cfg["position_side"]
+    return params
 
 
 # =========================================================================== #
