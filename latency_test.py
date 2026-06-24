@@ -434,11 +434,14 @@ class OkxRest:
             if item.get("sCode") != "0":
                 raise RuntimeError(f"условный ордер не размещён: {item}")
             return item.get("algoId")               # отмена идёт по algoId
-        item = self._request("POST", "/api/v5/trade/order", {
+        body = {
             "instId": self.cfg["inst_id"], "tdMode": self.cfg["td_mode"],
             "side": self.cfg.get("side", "buy"), "ordType": "limit",
             "px": self.cfg["price"], "sz": self.cfg["size"], "clOrdId": cl,
-        })["data"][0]
+        }
+        if self.cfg.get("pos_side"):                # long/short-режим
+            body["posSide"] = self.cfg["pos_side"]
+        item = self._request("POST", "/api/v5/trade/order", body)["data"][0]
         if item.get("sCode") != "0":
             raise RuntimeError(f"ордер не размещён: {item}")
         return cl
@@ -634,12 +637,15 @@ class OkxWs:
 
     def place_order(self):
         cl = gen_cl_id()
-        item = self._call("order", {
+        arg = {
             "instId": self.cfg["inst_id"], "instIdCode": self.inst_id_code,
             "tdMode": self.cfg["td_mode"],
             "side": self.cfg.get("side", "buy"), "ordType": "limit",
             "px": self.cfg["price"], "sz": self.cfg["size"], "clOrdId": cl,
-        })
+        }
+        if self.cfg.get("pos_side"):                # long/short-режим
+            arg["posSide"] = self.cfg["pos_side"]
+        item = self._call("order", arg)
         if item.get("sCode") != "0":
             raise RuntimeError(f"ордер не размещён: {item}")
         return cl
@@ -982,6 +988,33 @@ def resolve_position_side(cfg, market):
     return _pos_side_cache[key]
 
 
+def resolve_okx_pos_side(cfg):
+    """OKX в режиме long/short (hedge) требует posSide=long/short в каждом ордере
+    (иначе 51000 «Parameter posSide error»). В net-режиме posSide не нужен.
+    Определяем режим счёта один раз через /api/v5/account/config. Конфиг может
+    задать pos_side явно — тогда детект пропускаем."""
+    if cfg.get("pos_side"):
+        return cfg["pos_side"]
+    key = "OKX"
+    if key not in _pos_side_cache:
+        try:
+            data = OkxRest(cfg)._request("GET", "/api/v5/account/config", None)["data"]
+            pos_mode = data[0].get("posMode") if data else "net_mode"
+        except Exception as e:
+            print(f"  [pos-mode] OKX: не удалось определить ({e}) — без posSide")
+            _pos_side_cache[key] = None
+            return None
+        if pos_mode == "long_short_mode":
+            side = str(cfg.get("side", "buy")).lower()
+            ps = "long" if side.startswith("b") else "short"
+        else:
+            ps = None
+        _pos_side_cache[key] = ps
+        mode = f"long/short → posSide={ps}" if ps else "net (posSide не нужен)"
+        print(f"  [pos-mode] OKX futures: {mode}")
+    return _pos_side_cache[key]
+
+
 def server_time_ms(exch, base, is_futures, simulated, timeout):
     base = base.rstrip("/")
     if exch == "binance":
@@ -1133,6 +1166,10 @@ def run_okx(market, transport):
     cfg = okx_cfg(market)
     if okx_is_conditional(cfg) and balance_guard_on():
         balance_guard(cfg, market, "OKX")
+    if market == "futures":                         # long/short-режим требует posSide
+        ps = resolve_okx_pos_side(cfg)
+        if ps:
+            cfg["pos_side"] = ps
     if auto_price_on(cfg):
         cfg["price"] = _auto_price(
             ("OKX", market),
