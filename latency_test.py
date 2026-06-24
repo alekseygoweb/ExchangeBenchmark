@@ -695,6 +695,8 @@ def mexc_contract_params(cfg, cl):
         "openType": int(cfg.get("open_type", 2)),    # 1 isolated, 2 cross
         "externalOid": cl,
     }
+    if cfg.get("leverage"):                          # обычный ордер резервирует маржу сразу
+        body["leverage"] = int(cfg["leverage"])
     if otype not in (5, 6):                          # лимитным нужна цена
         body["price"] = float(cfg["price"])
     if cfg.get("trigger_price"):                     # trigger → planorder/place

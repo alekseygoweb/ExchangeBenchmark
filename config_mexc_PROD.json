@@ -14,7 +14,8 @@
         "type": 1,
         "price": "20000",
         "size": "1",
-        "open_type": 2
+        "open_type": 2,
+        "leverage": 20
     },
 
     "spot": {
