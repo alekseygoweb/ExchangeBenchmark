@@ -1269,6 +1269,10 @@ def time_sync_preflight(markets):
 #                                 Замер                                       #
 # =========================================================================== #
 REPEATS = int(os.environ.get("LATENCY_REPEATS", "5"))  # циклов "отправка+отмена"
+# Пауза между REST и WS прогонами одного рынка (вне замера). Даёт окну rate-limit
+# биржи сброситься — без неё OKX отдаёт 50011 на WS сразу после REST (особенно
+# при нулевом fill-ratio, как в этом бенчмарке). Поставьте 0, чтобы отключить.
+TRANSPORT_PAUSE_SEC = float(os.environ.get("TRANSPORT_PAUSE_SEC", "2"))
 
 
 def _ms(a, b):
@@ -1587,7 +1591,9 @@ def main():
     results = {}
     for label, fn, market, exch_name in markets:
         row = {}
-        for transport in ("API", "WS"):
+        for ti, transport in enumerate(("API", "WS")):
+            if ti > 0 and TRANSPORT_PAUSE_SEC > 0:   # дать rate-limit окну сброситься
+                time.sleep(TRANSPORT_PAUSE_SEC)
             try:
                 row[transport] = fn(market, transport)
             except Exception as e:
