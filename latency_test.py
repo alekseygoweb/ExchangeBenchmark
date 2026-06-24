@@ -669,15 +669,16 @@ class OkxWs:
 # =========================================================================== #
 #                              MEXC (REST)                                    #
 # =========================================================================== #
-# MEXC — две РАЗНЫЕ системы: спот (api.mexc.com, Binance-совместимый /api/v3) и
-# контракты (contract.mexc.com, своя подпись ApiKey+Request-Time+Signature).
-# ВАЖНО: фьючерсный order-API MEXC (и обычный order/submit, и trigger
-# planorder/place) уже давно «Under maintenance» — для обычных аккаунтов
-# вернёт code 500. Условные ордера у MEXC есть ТОЛЬКО на фьючерсах, поэтому
-# условный бенчмарк MEXC доступен лишь как попытка (документируем maintenance).
-# Спот же работает: лимитный ордер даёт реальные числа.
+# MEXC — две РАЗНЫЕ системы, обе на api.mexc.com: спот (Binance-совместимый
+# /api/v3, подпись X-MEXC-APIKEY) и контракты (/api/v1/private, своя подпись
+# ApiKey+Request-Time+Signature = HMAC(accessKey+ts+body)). Фьючерсный API
+# MEXC был «Under maintenance», но СНОВА ОТКРЫТ (перезапуск 31.03.2026): place
+# order = POST /api/v1/private/order/create, trigger = planorder/place/v2.
+# Требуется KYC + право Futures API trading у ключа, иначе придёт ошибка прав.
+# Условные ордера у MEXC есть только на фьючерсах. WS-API ордеров у MEXC нет —
+# замер только REST. Лимит контрактного order-API: 4 запроса / 2 с.
 MEXC_SPOT_BASE = "https://api.mexc.com"
-MEXC_CONTRACT_BASE = "https://contract.mexc.com"
+MEXC_CONTRACT_BASE = "https://api.mexc.com"
 
 
 def mexc_contract_params(cfg, cl):
@@ -773,7 +774,8 @@ class MexcRest:
             if not data.get("orderId"):
                 raise RuntimeError(f"ордер не размещён: {data}")
             return cl                                # отмена по clientOrderId
-        path = "/api/v1/private/planorder/place" if self.algo else "/api/v1/private/order/submit"
+        # Новый (переоткрытый) фьючерсный API: order/create, trigger → planorder/place/v2
+        path = "/api/v1/private/planorder/place/v2" if self.algo else "/api/v1/private/order/create"
         data = self._contract("POST", path, mexc_contract_params(self.cfg, cl))
         oid = data.get("data")
         if not oid:

@@ -1,6 +1,6 @@
 {
     "name": "MEXC (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
-    "_comment": "Ключи из .env (MEXC_API_KEY / MEXC_API_SECRET). СПОТ работает (api.mexc.com, Binance-совместимый). ФЬЮЧЕРСНЫЙ order-API MEXC (contract.mexc.com) — под maintenance, вернёт code 500. У MEXC нет WS-API размещения ордеров — замер только REST.",
+    "_comment": "Ключи из .env (MEXC_API_KEY / MEXC_API_SECRET). СПОТ работает (api.mexc.com, Binance-совместимый). ФЬЮЧЕРСНЫЙ order-API MEXC снова открыт (перезапуск 31.03.2026): place = POST /api/v1/private/order/create на api.mexc.com. Требуется KYC + право Futures API trading у ключа. У MEXC нет WS-API размещения ордеров — замер только REST.",
 
     "timeout_sec": 10,
     "auto_price": true,
