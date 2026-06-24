@@ -94,6 +94,8 @@ CONFIG_OKX = os.environ.get("CONFIG_OKX", "config_okx_PROD.json")
 # по умолчанию оставался безопасным лимитным, а «заряженный» конфиг был явным opt-in.
 CONFIG_BINANCE_CONDITIONAL = os.environ.get(
     "CONFIG_BINANCE_CONDITIONAL", "config_binance_PROD_conditional.json")
+CONFIG_OKX_CONDITIONAL = os.environ.get(
+    "CONFIG_OKX_CONDITIONAL", "config_okx_PROD_conditional.json")
 
 
 def _require_env(name):
@@ -356,9 +358,40 @@ class BinanceRest:
         return len(ours), len(left), self.position_amt()
 
 
+# Условные (algo) типы OKX: размещаются через /api/v5/trade/order-algo, а не
+# /api/v5/trade/order. Для benchmark используем "trigger" (стоп с triggerPx).
+OKX_ALGO_TYPES = {"trigger", "conditional", "oco", "move_order_stop"}
+
+
+def okx_is_conditional(cfg):
+    return str(cfg.get("ord_type", "limit")).lower() in OKX_ALGO_TYPES
+
+
+def okx_algo_params(cfg, cl):
+    """Тело algo-ордера OKX (POST /api/v5/trade/order-algo). Для trigger: triggerPx
+    (цена срабатывания) + orderPx (-1 = рыночный ордер при срабатывании). Наш
+    клиентский id идёт в algoClOrdId (по нему чистит reconcile)."""
+    p = {
+        "instId": cfg["inst_id"],
+        "tdMode": cfg["td_mode"],
+        "side": cfg.get("side", "buy"),
+        "ordType": cfg.get("ord_type", "trigger"),
+        "sz": cfg["size"],
+        "triggerPx": cfg["trigger_px"],
+        "orderPx": cfg.get("order_px", "-1"),
+        "algoClOrdId": cl,
+    }
+    if cfg.get("trigger_px_type"):                  # last/index/mark
+        p["triggerPxType"] = cfg["trigger_px_type"]
+    if cfg.get("pos_side"):                          # long/short режим (hedge)
+        p["posSide"] = cfg["pos_side"]
+    return p
+
+
 class OkxRest:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.algo = okx_is_conditional(cfg)
         self.base = cfg["base_url"].rstrip("/")
         self.key = cfg["api_key"]
         self.secret = cfg["api_secret"].encode()
@@ -395,6 +428,12 @@ class OkxRest:
 
     def place_order(self):
         cl = gen_cl_id()
+        if self.algo:                               # условный → algo-эндпоинт
+            item = self._request("POST", "/api/v5/trade/order-algo",
+                                 okx_algo_params(self.cfg, cl))["data"][0]
+            if item.get("sCode") != "0":
+                raise RuntimeError(f"условный ордер не размещён: {item}")
+            return item.get("algoId")               # отмена идёт по algoId
         item = self._request("POST", "/api/v5/trade/order", {
             "instId": self.cfg["inst_id"], "tdMode": self.cfg["td_mode"],
             "side": self.cfg.get("side", "buy"), "ordType": "limit",
@@ -404,13 +443,34 @@ class OkxRest:
             raise RuntimeError(f"ордер не размещён: {item}")
         return cl
 
-    def cancel_order(self, cl):
+    def cancel_order(self, oid):
+        if self.algo:                               # условный → cancel-algos по algoId
+            item = self._request("POST", "/api/v5/trade/cancel-algos",
+                                 [{"algoId": oid, "instId": self.inst}])["data"][0]
+            if item.get("sCode") != "0":
+                raise RuntimeError(f"условный ордер не отменён: {item}")
+            return
         item = self._request("POST", "/api/v5/trade/cancel-order",
-                             {"instId": self.cfg["inst_id"], "clOrdId": cl})["data"][0]
+                             {"instId": self.cfg["inst_id"], "clOrdId": oid})["data"][0]
         if item.get("sCode") != "0":
             raise RuntimeError(f"ордер не отменён: {item}")
 
+    def available_usdt(self):
+        """Свободный баланс USDT (для balance-guard перед условным ордером)."""
+        data = self._request("GET", "/api/v5/account/balance?ccy=USDT", None)["data"]
+        if not data:
+            return 0.0
+        for d in data[0].get("details", []):
+            if d.get("ccy") == "USDT":
+                return float(d.get("availBal") or d.get("cashBal") or 0)
+        return float(data[0].get("totalEq") or 0)
+
     def list_open(self):
+        if self.algo:
+            ot = self.cfg.get("ord_type", "trigger")
+            return self._request(
+                "GET", f"/api/v5/trade/orders-algo-pending?ordType={ot}&instId={self.inst}",
+                None)["data"]
         return self._request("GET", f"/api/v5/trade/orders-pending?instId={self.inst}",
                              None)["data"]
 
@@ -422,17 +482,23 @@ class OkxRest:
         return sum(float(p.get("pos") or 0) for p in data)
 
     def reconcile(self):
-        # Снимаем ТОЛЬКО свои ордера (clOrdId с префиксом "lt").
+        # Снимаем ТОЛЬКО свои ордера (id с префиксом "lt"). У algo-ордеров
+        # клиентский id лежит в algoClOrdId, отмена — по algoId.
+        id_field = "algoClOrdId" if self.algo else "clOrdId"
         ours = [o for o in self.list_open()
-                if str(o.get("clOrdId", "")).startswith("lt")]
+                if str(o.get(id_field, "")).startswith("lt")]
         for o in ours:
             try:
-                self._request("POST", "/api/v5/trade/cancel-order",
-                              {"instId": self.inst, "ordId": o["ordId"]})
+                if self.algo:
+                    self._request("POST", "/api/v5/trade/cancel-algos",
+                                  [{"algoId": o["algoId"], "instId": self.inst}])
+                else:
+                    self._request("POST", "/api/v5/trade/cancel-order",
+                                  {"instId": self.inst, "ordId": o["ordId"]})
             except Exception:
                 pass
         left = [o for o in self.list_open()
-                if str(o.get("clOrdId", "")).startswith("lt")]
+                if str(o.get(id_field, "")).startswith("lt")]
         return len(ours), len(left), self.position_amt()
 
 
@@ -863,23 +929,26 @@ def max_equity_usdt():
         return 50.0
 
 
-def balance_guard(cfg, market):
+def balance_guard(cfg, market, exch="Binance"):
     """Пускаем условный ордер только если на счёте слишком мало средств, чтобы он
     мог что-то открыть. Иначе — стоп с явным сообщением."""
-    key = ("Binance", market)
+    key = (exch, market)
     ceil = max_equity_usdt()
     fresh = key not in _guard_cache
     if fresh:
-        _guard_cache[key] = BinanceRest(cfg, market).available_usdt()
+        client = BinanceRest(cfg, market) if exch == "Binance" else OkxRest(cfg)
+        _guard_cache[key] = client.available_usdt()
     avail = _guard_cache[key]
     if avail > ceil:
+        size = cfg.get("quantity") or cfg.get("size")
+        inst = cfg.get("symbol") or cfg.get("inst_id")
         raise RuntimeError(
             f"balance-guard: доступно {avail:.2f} USDT > порога {ceil:.0f}. "
-            f"Условный ордер {cfg.get('quantity')} {cfg.get('symbol')} на пополненном "
-            f"счёте может открыть позицию. Отключить: BALANCE_GUARD=0 / --no-balance-guard, "
-            f"или поднять порог MAX_EQUITY_USDT.")
+            f"Условный ордер {size} {inst} на пополненном счёте может открыть позицию. "
+            f"Отключить: BALANCE_GUARD=0 / --no-balance-guard, или поднять порог "
+            f"MAX_EQUITY_USDT (триггер всё равно недостижим).")
     if fresh:
-        print(f"  [balance-guard] Binance {market}: доступно {avail:.2f} USDT ≤ {ceil:.0f} — ок")
+        print(f"  [balance-guard] {exch} {market}: доступно {avail:.2f} USDT ≤ {ceil:.0f} — ок")
 
 
 _pos_side_cache = {}
@@ -1024,7 +1093,7 @@ def binance_cfg(market):
 
 
 def okx_cfg(market):
-    full = load_config(CONFIG_OKX)
+    full = load_config(CONFIG_OKX_CONDITIONAL if conditional_on() else CONFIG_OKX)
     shared = {k: full[k] for k in
               ("base_url", "ws_url", "simulated", "timeout_sec",
                "auto_price", "price_offset_pct", "auto_size")
@@ -1062,6 +1131,8 @@ def run_binance(market, transport):
 
 def run_okx(market, transport):
     cfg = okx_cfg(market)
+    if okx_is_conditional(cfg) and balance_guard_on():
+        balance_guard(cfg, market, "OKX")
     if auto_price_on(cfg):
         cfg["price"] = _auto_price(
             ("OKX", market),
@@ -1073,6 +1144,11 @@ def run_okx(market, transport):
     if transport == "API":
         c = OkxRest(cfg)
         return measure(c.place_order, c.cancel_order)
+    if okx_is_conditional(cfg):
+        # OKX algo-ордера (trigger) размещаются только через REST — WS trade API
+        # их не поддерживает (op order/cancel-order, без order-algo).
+        raise RuntimeError("OKX: условные (trigger) ордера только через REST "
+                           "(WS trade API не поддерживает algo-ордера)")
     return measure_ws(OkxWs(cfg))
 
 

@@ -1,0 +1,32 @@
+{
+    "name": "OKX (PROD) — УСЛОВНЫЙ (trigger) бенчмарк",
+    "_comment": "Включается флагом --conditional / CONDITIONAL=1. Ключи берутся из .env.",
+    "_safety": "BUY trigger-ордер с НЕДОСТИЖИМЫМ triggerPx (10000000): сработал бы только при росте цены до 10 000 000, то есть никогда. orderPx=-1 — рыночный при срабатывании. OKX algo-ордера НЕ резервируют маржу до срабатывания (работают на почти пустом счёте) и сразу отменяются. Размер крупный только для замера — на латентность place/cancel НЕ влияет. balance-guard откажет, если на счёте > MAX_EQUITY_USDT (50): при необходимости поднимите порог (MAX_EQUITY_USDT) или отключите --no-balance-guard (триггер всё равно недостижим). OKX algo-ордера размещаются только через REST — WS trade API их не поддерживает. Бенчмарк: --conditional --exchange okx --market futures.",
+
+    "base_url": "https://www.okx.com",
+    "ws_url": "wss://ws.okx.com:8443/ws/v5/private",
+    "simulated": false,
+    "timeout_sec": 10,
+
+    "auto_price": false,
+    "auto_size": false,
+
+    "futures": {
+        "inst_id": "BTC-USDT-SWAP",
+        "td_mode": "cross",
+        "side": "buy",
+        "ord_type": "trigger",
+        "trigger_px": "10000000",
+        "order_px": "-1",
+        "size": "100"
+    },
+
+    "spot": {
+        "_comment": "Спот: условный бенчмарк крупным размером невозможен (резерв средств при срабатывании). Здесь обычный лимит с минимальным размером — для замера спота используйте auto-price/auto-size.",
+        "inst_id": "BTC-USDT",
+        "td_mode": "cash",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.001"
+    }
+}
