@@ -68,13 +68,33 @@ if sc2 == 200:
 else:
     print("    " + body2[:400].replace("\n", " "))
 
+# 3) Разрешения ключа (sapi на api.binance.com) — флаг PM снимает
+#    двусмысленность -2015 (нет PM-прав vs счёт не PM).
+print("\n[3] Разрешения ключа: GET https://api.binance.com/sapi/v1/account/apiRestrictions")
+sc3, body3 = signed_get("https://api.binance.com", "/sapi/v1/account/apiRestrictions")
+print(f"    HTTP {sc3}")
+print("    " + body3[:500].replace("\n", " "))
+pm_flag = None
+if sc3 == 200 and "enablePortfolioMarginTrading" in body3:
+    import json as _json
+    try:
+        pm_flag = bool(_json.loads(body3).get("enablePortfolioMarginTrading"))
+    except Exception:  # noqa: BLE001
+        pm_flag = None
+
 print("\n" + "=" * 70)
 if is_pm:
-    print("ВЫВОД: счёт Portfolio Margin (Единый счёт).")
+    print("ВЫВОД: счёт Portfolio Margin (papi доступен).")
     print("Условные ордера идут через  POST /papi/v1/um/conditional/order")
     print("на  https://papi.binance.com  — обычный /fapi/v1/order их отклоняет (-4120).")
+elif pm_flag is True:
+    print("ВЫВОД: у ключа ВКЛЮЧЁН Portfolio Margin Trading, но papi дал -2015.")
+    print("Вероятно нужно домкнуть права/привязать ключ к PM — но счёт PM. Реализуем papi.")
+elif pm_flag is False:
+    print("ВЫВОД: у ключа Portfolio Margin Trading ВЫКЛЮЧЕН.")
+    print("Если счёт всё же PM — включи это право у ключа и перезапусти.")
+    print("Если счёт классический — условные через Futures Algo API (простого стопа там нет).")
 else:
-    print("ВЫВОД: papi вернул не 200 — вероятно НЕ Portfolio Margin")
-    print("(или у ключа нет прав на PM-эндпоинты). Тогда условные ордера —")
-    print("через Futures Algo API. Покажи вывод выше для уточнения.")
+    print("ВЫВОД: однозначно по API не вышло (sapi/papi не дали PM-флаг).")
+    print("Проверь режим счёта в интерфейсе Binance (Wallet → Portfolio Margin).")
 print("=" * 70)
