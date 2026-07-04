@@ -1,0 +1,4435 @@
+diff --git a/docs/amneziawg.md b/docs/amneziawg.md
+new file mode 100644
+index 0000000..105af4e
+--- /dev/null
++++ b/docs/amneziawg.md
+@@ -0,0 +1,95 @@
++# AmneziaWG inbounds
++
++AmneziaWG (AWG) is WireGuard with added packet obfuscation designed to defeat
++Deep Packet Inspection: random junk packets before the handshake, per-message
++padding, and randomized "magic headers" that hide WireGuard's fixed message-type
++bytes. Because the obfuscation is symmetric, **the server must speak AmneziaWG
++too** — a stock WireGuard server cannot serve AmneziaWG clients (and vice-versa)
++once the obfuscation knobs are non-trivial.
++
++3x-ui runs the official Xray-core binary, whose WireGuard inbound is plain
++`wireguard-go` with no obfuscation. So AmneziaWG cannot be served by Xray. This
++panel therefore runs an **in-process AmneziaWG server** using the
++[`amneziawg-go`](https://github.com/amnezia-vpn/amneziawg-go) library over a
++userspace gVisor netstack — the same technique Xray-core uses for its own
++WireGuard inbound.
++
++## How it works
++
++- **No root, no kernel module, no extra binary.** The AmneziaWG device runs
++  inside the `x-ui` process on a userspace gVisor network stack. It binds the
++  inbound's UDP port, terminates the encrypted tunnel, and a TCP/UDP forwarder
++  carries the decrypted client traffic out through the host. This works in an
++  unprivileged Docker container, unlike the kernel `amneziawg` module.
++- **Managed like the mtproto sidecar.** AmneziaWG inbounds are excluded from the
++  Xray config (`internal/web/service/xray.go`). A manager
++  (`internal/awg/manager.go`) keeps one device per inbound; a cron job
++  (`internal/web/job/awg_job.go`, every 10s) reconciles the running devices
++  against the enabled `amneziawg` inbounds in the database and folds each
++  device's per-peer traffic into normal inbound/client accounting.
++- **Same client model as WireGuard.** Each AmneziaWG client is a WireGuard peer
++  (keypair + tunnel address + optional preshared key + keepalive). Client CRUD,
++  key generation, and address allocation are shared with WireGuard, so no
++  database migration is required — the obfuscation parameters live in the
++  inbound's settings JSON.
++- **Egress is fenced.** The forwarder refuses to dial loopback, private,
++  link-local, and unspecified addresses (`internal/util/netsafe`), so a tunnelled
++  client cannot reach the panel host's own services or the server's LAN. Clients
++  are isolated from each other by the same rule.
++
++## Obfuscation parameters
++
++Set on the inbound; the panel writes matching values into every client `.conf`.
++The AmneziaWG 2.0 scheme (as implemented by `amneziawg-go`) is supported:
++
++| Param | Type | Meaning |
++|---|---|---|
++| `Jc` | int | Junk packet count sent before each handshake (0 disables) |
++| `Jmin` / `Jmax` | int | Min/max size of each junk packet (bytes) |
++| `S1` / `S2` | int | Extra padding prepended to handshake init / response |
++| `S3` / `S4` | int | Padding for cookie-reply / transport messages (2.0) |
++| `H1`–`H4` | uint32 or `x-y` range | Magic headers for init / response / cookie / transport; replace WireGuard's fixed 1/2/3/4. Must be four distinct values |
++| `I1`–`I5` | string | Optional custom signature ("CPS") junk packets, e.g. `<b 0x…>`, `<r 40>` |
++
++`H1`–`H4` and `S1`–`S4` (and any `I`-packets) **must be identical** on client and
++server; `Jc`/`Jmin`/`Jmax` are one-way (client) junk. Leaving all of them unset
++makes the device behave as vanilla WireGuard. The inbound form's **Randomize**
++button generates a sound obfuscating set.
++
++## Using it
++
++1. Create an inbound, choose protocol **AmneziaWG**, pick a UDP port. A server
++   key is generated; click **Randomize** to fill the obfuscation parameters.
++2. Add clients exactly like WireGuard clients (a keypair and tunnel address are
++   allocated automatically).
++3. Open a client's **config / QR** and import the `.conf` into an AmneziaWG
++   client app (the standalone AmneziaWG app, or AmneziaVPN). AmneziaWG has no
++   `awg://` share-link scheme, so distribution is by `.conf` file or its QR.
++
++## Limitations
++
++- **Not delivered via subscription links.** AmneziaWG has no standard share-link
++  URL format, so clients are provisioned from the panel's config/QR, not the
++  subscription endpoint.
++- **Direct host egress.** Client traffic egresses from the panel host and does
++  **not** pass through Xray's routing/outbounds/blocking. Routing AmneziaWG
++  through Xray is a possible future enhancement.
++- **Parameter edits restart the device.** Changing the server key, port, MTU, or
++  obfuscation parameters rebuilds the device and briefly drops sessions;
++  adding/removing a client is applied live without a restart.
++
++## Verifying a deployment
++
++The panel's unit tests cover the parameter model, UAPI/`.conf` generation, and a
++real device lifecycle (`internal/awg`), but a full client handshake needs a real
++AmneziaWG client and a routable host, which CI does not have. To verify a live
++deployment:
++
++1. Create an AmneziaWG inbound with randomized parameters and add a client.
++2. Import the client `.conf` into an AmneziaWG client (e.g. the AmneziaWG app or
++   [`amneziawg-tools`](https://github.com/amnezia-vpn/amneziawg-tools) `awg-quick`).
++3. Confirm the handshake completes and traffic flows (`curl https://ifconfig.me`
++   should show the server's IP), and that the client's traffic counter advances
++   on the panel within ~10s.
++4. Confirm a stock WireGuard client with the same keys but **no** obfuscation
++   parameters cannot connect (proving the obfuscation is active).
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 9aee6af..3345a3b 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -422,6 +422,28 @@ unreachable. It periodically probes an HTTP URL (default: Cloudflare trace endpo
+ the tunnel; after N successive failures (default 3) it fires a recovery callback wired to an
+ Xray restart.
+ 
++### 5.9 AmneziaWG in-process backend
++
++AmneziaWG (obfuscated WireGuard) cannot be served by the stock Xray-core binary (plain
++`wireguard-go`, no obfuscation), so — like MTProto — it runs **outside** Xray. Unlike MTProto it
++needs **no sidecar binary**: `internal/awg/` embeds the `amnezia-vpn/amneziawg-go` library on a
++userspace gVisor netstack (the same technique as Xray's own WireGuard inbound), so it needs no root,
++no kernel module, and works in unprivileged Docker.
++
++- **`internal/awg/`**: `params.go` (obfuscation knobs Jc/Jmin/Jmax, S1–S4, H1–H4, I1–I5 + validation +
++  randomized defaults + UAPI/`.conf` rendering), `netstack.go` + `forwarder.go` (a forwarding gVisor
++  stack that carries decrypted client traffic to the host, fenced by `internal/util/netsafe`),
++  `device.go` (amneziawg-go device lifecycle + per-peer stats), `manager.go` (one device per inbound;
++  fingerprint decides restart vs. live peer update), `config.go` (`InstanceFromInbound`).
++- **Excluded from Xray config** in `service/xray.go` (a `continue` next to the MTProto skip).
++- **Dispatched** through `runtime/local.go` (AddInbound→Ensure, DelInbound→Remove); per-client changes
++  converge via the reconcile job.
++- **Reconcile + traffic**: `job/awg_job.go` (`@every 10s`), registered in `web.go` `startTask`;
++  `StopAll` on shutdown. Folds per-inbound and per-client traffic via `inboundService.AddTraffic`.
++- Reuses the **WireGuard client model** (no DB migration); classified UDP in `port_conflict.go`.
++
++See `docs/amneziawg.md` for the operator-facing guide and verification steps.
++
+ ---
+ 
+ ## 6. Data model cheat-sheet
+diff --git a/frontend/public/openapi.json b/frontend/public/openapi.json
+index c5ecfd1..82ebdc6 100644
+--- a/frontend/public/openapi.json
++++ b/frontend/public/openapi.json
+@@ -1678,6 +1678,7 @@
+               "trojan",
+               "shadowsocks",
+               "wireguard",
++              "amneziawg",
+               "hysteria",
+               "http",
+               "mixed",
+@@ -1824,6 +1825,10 @@
+       },
+       "InboundOption": {
+         "properties": {
++          "awgParams": {
++            "description": "AwgParams is the raw AmneziaWG obfuscation object (jc/jmin/jmax/s1-s4/\nh1-h4/i1-i5) from an amneziawg inbound's settings, so the clients page can\nrender a matching client .conf. Empty for non-amneziawg inbounds.",
++            "type": "string"
++          },
+           "enable": {
+             "example": true,
+             "type": "boolean"
+@@ -2800,6 +2805,7 @@
+                   "success": true,
+                   "obj": [
+                     {
++                      "awgParams": "",
+                       "enable": true,
+                       "id": 1,
+                       "listen": "",
+diff --git a/frontend/src/generated/examples.ts b/frontend/src/generated/examples.ts
+index ec63d47..f73d49c 100644
+--- a/frontend/src/generated/examples.ts
++++ b/frontend/src/generated/examples.ts
+@@ -399,6 +399,7 @@ export const EXAMPLES: Record<string, unknown> = {
+     "xver": 0
+   },
+   "InboundOption": {
++    "awgParams": "",
+     "enable": true,
+     "id": 1,
+     "listen": "",
+diff --git a/frontend/src/generated/schemas.ts b/frontend/src/generated/schemas.ts
+index 81df25b..a5536b8 100644
+--- a/frontend/src/generated/schemas.ts
++++ b/frontend/src/generated/schemas.ts
+@@ -1652,6 +1652,7 @@ export const SCHEMAS: Record<string, unknown> = {
+           "trojan",
+           "shadowsocks",
+           "wireguard",
++          "amneziawg",
+           "hysteria",
+           "http",
+           "mixed",
+@@ -1798,6 +1799,10 @@ export const SCHEMAS: Record<string, unknown> = {
+   },
+   "InboundOption": {
+     "properties": {
++      "awgParams": {
++        "description": "AwgParams is the raw AmneziaWG obfuscation object (jc/jmin/jmax/s1-s4/\nh1-h4/i1-i5) from an amneziawg inbound's settings, so the clients page can\nrender a matching client .conf. Empty for non-amneziawg inbounds.",
++        "type": "string"
++      },
+       "enable": {
+         "example": true,
+         "type": "boolean"
+diff --git a/frontend/src/generated/types.ts b/frontend/src/generated/types.ts
+index bcb9343..7152a51 100644
+--- a/frontend/src/generated/types.ts
++++ b/frontend/src/generated/types.ts
+@@ -393,6 +393,7 @@ export interface InboundFallback {
+ }
+ 
+ export interface InboundOption {
++  awgParams?: string;
+   enable: boolean;
+   id: number;
+   listen?: string;
+diff --git a/frontend/src/generated/zod.ts b/frontend/src/generated/zod.ts
+index c968699..9918d4c 100644
+--- a/frontend/src/generated/zod.ts
++++ b/frontend/src/generated/zod.ts
+@@ -384,7 +384,7 @@ export const InboundSchema = z.object({
+   nodeId: z.number().int().nullable().optional(),
+   originNodeGuid: z.string().optional(),
+   port: z.number().int().min(0).max(65535),
+-  protocol: z.enum(['vmess', 'vless', 'trojan', 'shadowsocks', 'wireguard', 'hysteria', 'http', 'mixed', 'tunnel', 'tun', 'mtproto']),
++  protocol: z.enum(['vmess', 'vless', 'trojan', 'shadowsocks', 'wireguard', 'amneziawg', 'hysteria', 'http', 'mixed', 'tunnel', 'tun', 'mtproto']),
+   remark: z.string(),
+   settings: z.unknown(),
+   shareAddr: z.string(),
+@@ -420,6 +420,7 @@ export const InboundFallbackSchema = z.object({
+ export type InboundFallback = z.infer<typeof InboundFallbackSchema>;
+ 
+ export const InboundOptionSchema = z.object({
++  awgParams: z.string().optional(),
+   enable: z.boolean(),
+   id: z.number().int(),
+   listen: z.string().optional(),
+diff --git a/frontend/src/lib/xray/awg.ts b/frontend/src/lib/xray/awg.ts
+new file mode 100644
+index 0000000..9ab1bb0
+--- /dev/null
++++ b/frontend/src/lib/xray/awg.ts
+@@ -0,0 +1,157 @@
++import { RandomUtil } from '@/utils';
++
++// Shared helpers for AmneziaWG obfuscation parameters — the `awg` object on an
++// amneziawg inbound and the raw `awgParams` JSON the clients page consumes.
++// Keeps the client .conf emit rules and the randomizer in one place so the
++// form, the inbound defaults, and both config generators stay in lockstep.
++
++// jc/jmin/jmax/s1-s4 are numbers (0 = off); h1-h4/i1-i5 are strings (a uint32
++// or an "x-y" magic-header range, or an optional CPS junk tag). Fields are read
++// defensively so a raw backend JSON object (numbers/strings) coerces cleanly.
++export interface AwgParamsLike {
++  jc?: number;
++  jmin?: number;
++  jmax?: number;
++  s1?: number;
++  s2?: number;
++  s3?: number;
++  s4?: number;
++  h1?: string;
++  h2?: string;
++  h3?: string;
++  h4?: string;
++  i1?: string;
++  i2?: string;
++  i3?: string;
++  i4?: string;
++  i5?: string;
++}
++
++function num(v: unknown): number {
++  return typeof v === 'number' && Number.isFinite(v) ? v : Number(v) || 0;
++}
++
++function str(v: unknown): string {
++  if (typeof v === 'string') return v.trim();
++  return v == null ? '' : String(v).trim();
++}
++
++// Emit the AmneziaWG [Interface] keys (CamelCase) for a client .conf, matching
++// the Go awg.Params.appendConfLines rules exactly: Jc/Jmin/Jmax only when jc>0;
++// S1..S4 only when >0; H1..H4/I1..I5 only when the string is non-empty. The
++// values must match the server for the handshake to complete.
++export function formatAwgInterfaceLines(params: AwgParamsLike | null | undefined): string[] {
++  if (!params) return [];
++  const lines: string[] = [];
++  const jc = num(params.jc);
++  if (jc > 0) {
++    lines.push(`Jc = ${jc}`);
++    lines.push(`Jmin = ${num(params.jmin)}`);
++    lines.push(`Jmax = ${num(params.jmax)}`);
++  }
++  const sVals: [string, number][] = [
++    ['S1', num(params.s1)],
++    ['S2', num(params.s2)],
++    ['S3', num(params.s3)],
++    ['S4', num(params.s4)],
++  ];
++  for (const [key, v] of sVals) {
++    if (v > 0) lines.push(`${key} = ${v}`);
++  }
++  const hVals: [string, string][] = [
++    ['H1', str(params.h1)],
++    ['H2', str(params.h2)],
++    ['H3', str(params.h3)],
++    ['H4', str(params.h4)],
++  ];
++  for (const [key, v] of hVals) {
++    if (v !== '') lines.push(`${key} = ${v}`);
++  }
++  const iVals: [string, string][] = [
++    ['I1', str(params.i1)],
++    ['I2', str(params.i2)],
++    ['I3', str(params.i3)],
++    ['I4', str(params.i4)],
++    ['I5', str(params.i5)],
++  ];
++  for (const [key, v] of iVals) {
++    if (v !== '') lines.push(`${key} = ${v}`);
++  }
++  return lines;
++}
++
++// Parse the raw `awgParams` JSON string carried on the clients-page
++// InboundOption into an AwgParamsLike. Returns null when absent or unparseable.
++export function parseAwgParams(raw: string | null | undefined): AwgParamsLike | null {
++  if (!raw || raw.trim() === '') return null;
++  try {
++    const parsed = JSON.parse(raw);
++    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
++      ? (parsed as AwgParamsLike)
++      : null;
++  } catch {
++    return null;
++  }
++}
++
++// A fully-populated awg object suitable as the default for a new AmneziaWG
++// inbound and as the value the form's Randomize button writes.
++export interface AwgRandomParams {
++  jc: number;
++  jmin: number;
++  jmax: number;
++  s1: number;
++  s2: number;
++  s3: number;
++  s4: number;
++  h1: string;
++  h2: string;
++  h3: string;
++  h4: string;
++  i1: string;
++  i2: string;
++  i3: string;
++  i4: string;
++  i5: string;
++}
++
++// Randomized obfuscating parameters mirroring the Go awg.GenerateParams: a
++// handful of junk packets, small init/response paddings, and four distinct
++// magic headers well above WireGuard's reserved 1-4 message types. S3/S4 and
++// I1-I5 stay 0/'' (rarely used, and omitted from the emitted .conf).
++export function randomizeAwgParams(): AwgRandomParams {
++  const jmin = RandomUtil.randomInteger(40, 89);
++  const [h1, h2, h3, h4] = randomDistinctHeaders();
++  return {
++    jc: RandomUtil.randomInteger(3, 10),
++    jmin,
++    jmax: jmin + 20 + RandomUtil.randomInteger(0, 80),
++    s1: RandomUtil.randomInteger(15, 150),
++    s2: RandomUtil.randomInteger(15, 150),
++    s3: 0,
++    s4: 0,
++    h1,
++    h2,
++    h3,
++    h4,
++    i1: '',
++    i2: '',
++    i3: '',
++    i4: '',
++    i5: '',
++  };
++}
++
++// Four distinct uint32 magic headers, each above 4 so they never collide with
++// WireGuard's reserved message-type bytes.
++function randomDistinctHeaders(): [string, string, string, string] {
++  const seen = new Set<number>();
++  const out: string[] = [];
++  while (out.length < 4) {
++    const v = RandomUtil.randomInteger(5, 4294967295);
++    if (seen.has(v)) continue;
++    seen.add(v);
++    out.push(String(v));
++  }
++  return [out[0], out[1], out[2], out[3]];
++}
+diff --git a/frontend/src/lib/xray/forms/transport/FinalMaskForm.tsx b/frontend/src/lib/xray/forms/transport/FinalMaskForm.tsx
+index ce04a24..fee9aab 100644
+--- a/frontend/src/lib/xray/forms/transport/FinalMaskForm.tsx
++++ b/frontend/src/lib/xray/forms/transport/FinalMaskForm.tsx
+@@ -192,10 +192,11 @@ export default function FinalMaskForm({ name, network, protocol, form, showAll =
+   }, []);
+ 
+   const isHysteria = protocol === OutboundProtocols.Hysteria || protocol === 'hysteria';
+-  // Wireguard carries no user-selectable transport (always a UDP listener/
+-  // dialer), so only the UDP mask section applies — TCP masks would never
+-  // wrap anything even though the leftover network value may be 'tcp'.
+-  const isWireguard = protocol === 'wireguard';
++  // Wireguard (and AmneziaWG, its obfuscated sibling) carries no user-selectable
++  // transport (always a UDP listener/dialer), so only the UDP mask section
++  // applies — TCP masks would never wrap anything even though the leftover
++  // network value may be 'tcp'.
++  const isWireguard = protocol === 'wireguard' || protocol === 'amneziawg';
+   const showTcp = showAll || (!isWireguard && TCP_NETWORKS.includes(network));
+   const showUdp = showAll || isHysteria || isWireguard || network === 'kcp';
+   const showQuic = showAll || isHysteria || network === 'xhttp';
+diff --git a/frontend/src/lib/xray/inbound-defaults.ts b/frontend/src/lib/xray/inbound-defaults.ts
+index ad5b5be..d6a41a7 100644
+--- a/frontend/src/lib/xray/inbound-defaults.ts
++++ b/frontend/src/lib/xray/inbound-defaults.ts
+@@ -1,5 +1,7 @@
+ import { RandomUtil, Wireguard } from '@/utils';
+ 
++import { randomizeAwgParams } from './awg';
++import type { AmneziawgInboundSettings } from '@/schemas/protocols/inbound/amneziawg';
+ import type { HttpInboundSettings } from '@/schemas/protocols/inbound/http';
+ import type { HysteriaClient, HysteriaInboundSettings } from '@/schemas/protocols/inbound/hysteria';
+ import type { MixedInboundSettings } from '@/schemas/protocols/inbound/mixed';
+@@ -281,6 +283,29 @@ export function createDefaultWireguardInboundSettings(
+   };
+ }
+ 
++export interface AmneziawgInboundSeed {
++  mtu?: number;
++  secretKey?: string;
++  noKernelTun?: boolean;
++}
++
++// AmneziaWG is WireGuard plus packet obfuscation: a new inbound holds the same
++// server identity (secretKey/mtu) and starts with no clients, plus a randomized
++// `awg` obfuscation object (matching the form's Randomize button) so the tunnel
++// diverges from a fingerprintable WireGuard flow out of the box.
++export function createDefaultAmneziawgInboundSettings(
++  seed: AmneziawgInboundSeed = {},
++): AmneziawgInboundSettings {
++  return {
++    mtu: seed.mtu ?? 1420,
++    secretKey: seed.secretKey ?? Wireguard.generateKeypair().privateKey,
++    peers: [],
++    clients: [],
++    noKernelTun: seed.noKernelTun ?? false,
++    awg: randomizeAwgParams(),
++  };
++}
++
+ // Protocol-aware dispatch over every inbound-settings factory. Mirrors
+ // the legacy `Inbound.Settings.getSettings(protocol)` dispatcher, but
+ // returns a plain Zod-parsable object instead of a class instance.
+@@ -297,6 +322,7 @@ export type AnyInboundSettings =
+   | TunInboundSettings
+   | TunnelInboundSettings
+   | WireguardInboundSettings
++  | AmneziawgInboundSettings
+   | MtprotoInboundSettings;
+ 
+ export function createDefaultInboundSettings(protocol: string): AnyInboundSettings | null {
+@@ -311,6 +337,7 @@ export function createDefaultInboundSettings(protocol: string): AnyInboundSettin
+     case 'tunnel':      return createDefaultTunnelInboundSettings();
+     case 'tun':         return createDefaultTunInboundSettings();
+     case 'wireguard':   return createDefaultWireguardInboundSettings();
++    case 'amneziawg':   return createDefaultAmneziawgInboundSettings();
+     case 'mtproto':     return createDefaultMtprotoInboundSettings();
+     default:            return null;
+   }
+diff --git a/frontend/src/lib/xray/inbound-form-adapter.ts b/frontend/src/lib/xray/inbound-form-adapter.ts
+index dc053b8..750645c 100644
+--- a/frontend/src/lib/xray/inbound-form-adapter.ts
++++ b/frontend/src/lib/xray/inbound-form-adapter.ts
+@@ -238,6 +238,7 @@ function clientSchemaForProtocol(protocol: string): z.ZodType | null {
+     case 'shadowsocks': return ShadowsocksClientSchema;
+     case 'hysteria': return HysteriaClientSchema;
+     case 'wireguard': return WireguardClientSchema;
++    case 'amneziawg': return WireguardClientSchema;
+     default: return null;
+   }
+ }
+diff --git a/frontend/src/lib/xray/inbound-link.ts b/frontend/src/lib/xray/inbound-link.ts
+index abd6402..cbd7f29 100644
+--- a/frontend/src/lib/xray/inbound-link.ts
++++ b/frontend/src/lib/xray/inbound-link.ts
+@@ -1,5 +1,6 @@
+ import { Base64, Wireguard } from '@/utils';
+ 
++import { formatAwgInterfaceLines, type AwgParamsLike } from './awg';
+ import type { Inbound } from '@/schemas/api/inbound';
+ import type { VlessClient } from '@/schemas/protocols/inbound/vless';
+ import type { VmessSecurity } from '@/schemas/protocols/shared/vmess';
+@@ -794,7 +795,10 @@ export function genMtprotoLink(input: GenMtprotoLinkInput): string {
+ }
+ 
+ export interface GenWireguardLinkInput {
+-  settings: WireguardInboundSettings;
++  // AmneziaWG shares the WireGuard settings shape and adds an inbound-level
++  // `awg` obfuscation object; carry it optionally so genWireguardConfig can
++  // append the matching [Interface] keys for amneziawg inbounds.
++  settings: WireguardInboundSettings & { awg?: AwgParamsLike };
+   address: string;
+   port: number;
+   remark?: string;
+@@ -851,6 +855,11 @@ export function genWireguardConfig(input: GenWireguardLinkInput): string {
+   if (typeof settings.mtu === 'number' && settings.mtu > 0) {
+     txt += `MTU = ${settings.mtu}\n`;
+   }
++  // AmneziaWG obfuscation keys (Jc/Jmin/Jmax/S1-S4/H1-H4/I1-I5) go in
++  // [Interface] and must match the server; empty for a plain wireguard inbound.
++  for (const line of formatAwgInterfaceLines(settings.awg)) {
++    txt += `${line}\n`;
++  }
+   txt += `\n# ${remark}\n`;
+   txt += `[Peer]\n`;
+   txt += `PublicKey = ${pubKey}\n`;
+@@ -1217,7 +1226,7 @@ export function genInboundLinks(input: GenInboundLinksInput): string {
+   if (inbound.protocol === 'shadowsocks') {
+     return genShadowsocksLink({ inbound, address: addr, port: inbound.port, forceTls: 'same', remark });
+   }
+-  if (inbound.protocol === 'wireguard') {
++  if (inbound.protocol === 'wireguard' || inbound.protocol === 'amneziawg') {
+     return genWireguardConfigs({ inbound, remark, hostOverride, fallbackHostname });
+   }
+   return '';
+@@ -1248,12 +1257,12 @@ function wgRenderPeers(settings: WireguardInboundSettings): WireguardInboundPeer
+ 
+ export function genWireguardLinks(input: GenWireguardFanoutInput): string {
+   const { inbound, remark = '', hostOverride = '', fallbackHostname } = input;
+-  if (inbound.protocol !== 'wireguard') return '';
++  if (inbound.protocol !== 'wireguard' && inbound.protocol !== 'amneziawg') return '';
+   const addr = resolveAddr(inbound, hostOverride, fallbackHostname);
+   const sep = '-';
+-  const baseSettings = inbound.settings as WireguardInboundSettings;
++  const baseSettings = inbound.settings as WireguardInboundSettings & { awg?: AwgParamsLike };
+   const peers = wgRenderPeers(baseSettings);
+-  const settings: WireguardInboundSettings = { ...baseSettings, peers };
++  const settings = { ...baseSettings, peers };
+   return peers
+     .map((p, i) => genWireguardLink({
+       settings,
+@@ -1267,12 +1276,12 @@ export function genWireguardLinks(input: GenWireguardFanoutInput): string {
+ 
+ export function genWireguardConfigs(input: GenWireguardFanoutInput): string {
+   const { inbound, remark = '', hostOverride = '', fallbackHostname } = input;
+-  if (inbound.protocol !== 'wireguard') return '';
++  if (inbound.protocol !== 'wireguard' && inbound.protocol !== 'amneziawg') return '';
+   const addr = resolveAddr(inbound, hostOverride, fallbackHostname);
+   const sep = '-';
+-  const baseSettings = inbound.settings as WireguardInboundSettings;
++  const baseSettings = inbound.settings as WireguardInboundSettings & { awg?: AwgParamsLike };
+   const peers = wgRenderPeers(baseSettings);
+-  const settings: WireguardInboundSettings = { ...baseSettings, peers };
++  const settings = { ...baseSettings, peers };
+   return peers
+     .map((p, i) => genWireguardConfig({
+       settings,
+diff --git a/frontend/src/lib/xray/inbound-tag.ts b/frontend/src/lib/xray/inbound-tag.ts
+index 8f4901a..8da1f03 100644
+--- a/frontend/src/lib/xray/inbound-tag.ts
++++ b/frontend/src/lib/xray/inbound-tag.ts
+@@ -14,7 +14,7 @@ function inboundTransports(
+   streamSettings: Record<string, unknown> | undefined,
+   settings: Record<string, unknown> | undefined,
+ ): TransportBits {
+-  if (protocol === 'hysteria' || protocol === 'wireguard') return UDP;
++  if (protocol === 'hysteria' || protocol === 'wireguard' || protocol === 'amneziawg') return UDP;
+ 
+   let bits: TransportBits = 0;
+   const network = asString(streamSettings?.network);
+diff --git a/frontend/src/lib/xray/protocol-capabilities.ts b/frontend/src/lib/xray/protocol-capabilities.ts
+index 9568ea1..740747b 100644
+--- a/frontend/src/lib/xray/protocol-capabilities.ts
++++ b/frontend/src/lib/xray/protocol-capabilities.ts
+@@ -9,7 +9,7 @@ const TLS_ELIGIBLE_PROTOCOLS = ['vmess', 'vless', 'trojan', 'shadowsocks'];
+ const TLS_NETWORKS = ['tcp', 'ws', 'http', 'grpc', 'httpupgrade', 'xhttp'];
+ const REALITY_ELIGIBLE_PROTOCOLS = ['vless', 'trojan'];
+ const REALITY_NETWORKS = ['tcp', 'http', 'grpc', 'xhttp'];
+-const STREAM_PROTOCOLS = ['vmess', 'vless', 'trojan', 'shadowsocks', 'hysteria', 'wireguard', 'tunnel'];
++const STREAM_PROTOCOLS = ['vmess', 'vless', 'trojan', 'shadowsocks', 'hysteria', 'wireguard', 'amneziawg', 'tunnel'];
+ const VISION_FLOW = 'xtls-rprx-vision';
+ const SS_2022_PREFIX = '2022';
+ const SS_BLAKE3_CHACHA20 = '2022-blake3-chacha20-poly1305';
+diff --git a/frontend/src/models/dbinbound.ts b/frontend/src/models/dbinbound.ts
+index 81eecbd..bdfa521 100644
+--- a/frontend/src/models/dbinbound.ts
++++ b/frontend/src/models/dbinbound.ts
+@@ -163,6 +163,10 @@ export class DBInbound {
+         return this.protocol === Protocols.WIREGUARD;
+     }
+ 
++    get isAmneziawg() {
++        return this.protocol === Protocols.AMNEZIAWG;
++    }
++
+     get isHysteria() {
+         return this.protocol === Protocols.HYSTERIA;
+     }
+diff --git a/frontend/src/pages/clients/ClientBulkAddModal.tsx b/frontend/src/pages/clients/ClientBulkAddModal.tsx
+index 753936c..1062ec8 100644
+--- a/frontend/src/pages/clients/ClientBulkAddModal.tsx
++++ b/frontend/src/pages/clients/ClientBulkAddModal.tsx
+@@ -16,7 +16,7 @@ import { ClientBulkAddFormSchema, type ClientBulkAddFormValues } from '@/schemas
+ const FLOW_OPTIONS = Object.values(TLS_FLOW_CONTROL);
+ 
+ const MULTI_CLIENT_PROTOCOLS = new Set([
+-  'shadowsocks', 'vless', 'vmess', 'trojan', 'hysteria', 'wireguard',
++  'shadowsocks', 'vless', 'vmess', 'trojan', 'hysteria', 'wireguard', 'amneziawg',
+ ]);
+ 
+ interface ClientBulkAddModalProps {
+diff --git a/frontend/src/pages/clients/ClientFormModal.tsx b/frontend/src/pages/clients/ClientFormModal.tsx
+index 633ab32..a2be493 100644
+--- a/frontend/src/pages/clients/ClientFormModal.tsx
++++ b/frontend/src/pages/clients/ClientFormModal.tsx
+@@ -35,7 +35,7 @@ const FLOW_OPTIONS = Object.values(TLS_FLOW_CONTROL);
+ const VMESS_SECURITY_OPTIONS = ['auto', 'aes-128-gcm', 'chacha20-poly1305', 'none', 'zero'] as const;
+ 
+ const MULTI_CLIENT_PROTOCOLS = new Set([
+-  'shadowsocks', 'vless', 'vmess', 'trojan', 'hysteria', 'wireguard',
++  'shadowsocks', 'vless', 'vmess', 'trojan', 'hysteria', 'wireguard', 'amneziawg',
+ ]);
+ 
+ const CLIENT_FORM_MODAL_Z_INDEX = 1000;
+@@ -305,7 +305,7 @@ export default function ClientFormModal({
+   const wireguardIds = useMemo(() => {
+     const ids = new Set<number>();
+     for (const row of inbounds || []) {
+-      if (row && row.protocol === 'wireguard') ids.add(row.id);
++      if (row && (row.protocol === 'wireguard' || row.protocol === 'amneziawg')) ids.add(row.id);
+     }
+     return ids;
+   }, [inbounds]);
+diff --git a/frontend/src/pages/clients/ClientInfoModal.tsx b/frontend/src/pages/clients/ClientInfoModal.tsx
+index 13441d6..b6bad1a 100644
+--- a/frontend/src/pages/clients/ClientInfoModal.tsx
++++ b/frontend/src/pages/clients/ClientInfoModal.tsx
+@@ -23,6 +23,7 @@ const INBOUND_PROTOCOL_COLORS: Record<string, string> = {
+   hysteria: 'cyan',
+   hysteria2: 'green',
+   wireguard: 'gold',
++  amneziawg: 'gold',
+   http: 'purple',
+   mixed: 'lime',
+   tunnel: 'orange',
+diff --git a/frontend/src/pages/clients/ClientsPage.tsx b/frontend/src/pages/clients/ClientsPage.tsx
+index f89e630..be79460 100644
+--- a/frontend/src/pages/clients/ClientsPage.tsx
++++ b/frontend/src/pages/clients/ClientsPage.tsx
+@@ -139,6 +139,7 @@ const INBOUND_PROTOCOL_COLORS: Record<string, string> = {
+   hysteria: 'cyan',
+   hysteria2: 'green',
+   wireguard: 'gold',
++  amneziawg: 'gold',
+   http: 'purple',
+   mixed: 'lime',
+   tunnel: 'orange',
+diff --git a/frontend/src/pages/clients/wireguardConfig.ts b/frontend/src/pages/clients/wireguardConfig.ts
+index 27196a0..9ca7ce6 100644
+--- a/frontend/src/pages/clients/wireguardConfig.ts
++++ b/frontend/src/pages/clients/wireguardConfig.ts
+@@ -1,5 +1,6 @@
+ import { formatInboundLabel } from '@/lib/inbounds/label';
+ import { preferPublicHost, resolveShareHost } from '@/lib/xray/inbound-link';
++import { formatAwgInterfaceLines, parseAwgParams } from '@/lib/xray/awg';
+ import type { ClientRecord, InboundOption } from '@/hooks/useClients';
+ 
+ export function isWireguardClient(client: ClientRecord | null | undefined): boolean {
+@@ -13,7 +14,7 @@ export function findWireguardInbound(
+ ): InboundOption | undefined {
+   return (client?.inboundIds || [])
+     .map((id) => inboundsById[id])
+-    .find((ib) => ib?.protocol === 'wireguard');
++    .find((ib) => ib?.protocol === 'wireguard' || ib?.protocol === 'amneziawg');
+ }
+ 
+ export function buildWireguardClientConfig(
+@@ -34,6 +35,14 @@ export function buildWireguardClientConfig(
+     `DNS = ${inbound?.wgDns || '1.1.1.1, 1.0.0.1'}`,
+   ];
+   if (inbound?.wgMtu && inbound.wgMtu > 0) lines.push(`MTU = ${inbound.wgMtu}`);
++  // AmneziaWG inbounds carry an obfuscation object as raw JSON in awgParams;
++  // its Jc/Jmin/Jmax/S1-S4/H1-H4/I1-I5 keys go in [Interface] and must match
++  // the server. Empty for a plain wireguard inbound (awgParams absent).
++  if (inbound?.awgParams) {
++    for (const line of formatAwgInterfaceLines(parseAwgParams(inbound.awgParams))) {
++      lines.push(line);
++    }
++  }
+   lines.push('');
+   if (remark) lines.push(`# ${remark}`);
+   lines.push('[Peer]', `PublicKey = ${inbound?.wgPublicKey || ''}`);
+diff --git a/frontend/src/pages/inbounds/form/InboundFormModal.tsx b/frontend/src/pages/inbounds/form/InboundFormModal.tsx
+index 23255e7..8e62420 100644
+--- a/frontend/src/pages/inbounds/form/InboundFormModal.tsx
++++ b/frontend/src/pages/inbounds/form/InboundFormModal.tsx
+@@ -56,6 +56,7 @@ import './InboundFormModal.css';
+ import { AdvancedAllEditor, AdvancedSliceEditor } from './advanced-editors';
+ import { formatInboundIssue, formatInboundValidation } from './formatValidationError';
+ import {
++  AmneziawgFields,
+   HttpFields,
+   HysteriaFields,
+   MixedFields,
+@@ -106,6 +107,7 @@ const NODE_ELIGIBLE_PROTOCOLS = new Set<string>([
+   Protocols.SHADOWSOCKS,
+   Protocols.HYSTERIA,
+   Protocols.WIREGUARD,
++  Protocols.AMNEZIAWG,
+ ]);
+ 
+ function isValidShareAddrInput(value: string): boolean {
+@@ -216,6 +218,7 @@ export default function InboundFormModal({
+   const hasSelectableTransport =
+     protocol !== Protocols.HYSTERIA
+     && protocol !== Protocols.WIREGUARD
++    && protocol !== Protocols.AMNEZIAWG
+     && protocol !== Protocols.TUNNEL;
+ 
+   const wPort = Form.useWatch('port', form);
+@@ -434,8 +437,8 @@ export default function InboundFormModal({
+             }],
+           },
+         });
+-      } else if (next === Protocols.WIREGUARD || next === Protocols.TUNNEL) {
+-        // Wireguard and Tunnel (dokodemo-door) have no user-selectable
++      } else if (next === Protocols.WIREGUARD || next === Protocols.AMNEZIAWG || next === Protocols.TUNNEL) {
++        // Wireguard/AmneziaWG and Tunnel (dokodemo-door) have no user-selectable
+         // transport: wireguard is always a UDP listener, and tunnel only needs
+         // `sockopt.tproxy` for its TProxy/redirect mode. Drop the leftover
+         // network/transport slices so the stream tab doesn't render a TCP
+@@ -681,6 +684,8 @@ export default function InboundFormModal({
+     <>
+       {protocol === Protocols.WIREGUARD && <WireguardFields wgPubKey={wgPubKey} regenInboundWg={regenInboundWg} />}
+ 
++      {protocol === Protocols.AMNEZIAWG && <AmneziawgFields wgPubKey={wgPubKey} regenInboundWg={regenInboundWg} />}
++
+       {protocol === Protocols.TUN && <TunFields />}
+ 
+       {protocol === Protocols.TUNNEL && <TunnelFields />}
+@@ -1028,6 +1033,7 @@ export default function InboundFormModal({
+               Protocols.TUNNEL,
+               Protocols.TUN,
+               Protocols.WIREGUARD,
++              Protocols.AMNEZIAWG,
+               Protocols.MTPROTO,
+             ] as string[]).includes(protocol) || isFallbackHost
+               ? [{ key: 'protocol', label: t('pages.inbounds.protocol'), children: protocolTab, forceRender: true }]
+@@ -1035,9 +1041,9 @@ export default function InboundFormModal({
+             ...(streamEnabled
+               ? [
+                 { key: 'stream', label: t('pages.inbounds.streamTab'), children: streamTab, forceRender: true },
+-                // Wireguard and Tunnel can't do TLS/Reality (canEnableTls is false), so
+-                // the security tab would only show a fully disabled radio.
+-                ...(protocol !== Protocols.WIREGUARD && protocol !== Protocols.TUNNEL
++                // Wireguard/AmneziaWG and Tunnel can't do TLS/Reality (canEnableTls is
++                // false), so the security tab would only show a fully disabled radio.
++                ...(protocol !== Protocols.WIREGUARD && protocol !== Protocols.AMNEZIAWG && protocol !== Protocols.TUNNEL
+                   ? [{ key: 'security', label: t('pages.inbounds.securityTab'), children: securityTab, forceRender: true }]
+                   : []),
+               ]
+diff --git a/frontend/src/pages/inbounds/form/protocols/amneziawg.tsx b/frontend/src/pages/inbounds/form/protocols/amneziawg.tsx
+new file mode 100644
+index 0000000..3307966
+--- /dev/null
++++ b/frontend/src/pages/inbounds/form/protocols/amneziawg.tsx
+@@ -0,0 +1,136 @@
++import { useTranslation } from 'react-i18next';
++import { Button, Collapse, Form, Input, InputNumber, Select, Space, Switch } from 'antd';
++import { ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons';
++
++import { randomizeAwgParams } from '@/lib/xray/awg';
++
++interface AmneziawgFieldsProps {
++  wgPubKey: string;
++  regenInboundWg: () => void;
++}
++
++// Path helper for the inbound-level obfuscation object (settings.awg.*).
++const awgPath = (key: string): (string | number)[] => ['settings', 'awg', key];
++
++// AmneziaWG is WireGuard plus packet obfuscation: the top half mirrors
++// WireguardFields exactly (same server identity + per-client model), and the
++// bottom half edits the inbound-level `awg` obfuscation knobs that must match
++// between server and client for the handshake to complete.
++export default function AmneziawgFields({ wgPubKey, regenInboundWg }: AmneziawgFieldsProps) {
++  const { t } = useTranslation();
++  const form = Form.useFormInstance();
++
++  const randomizeAwg = () => {
++    form.setFieldValue(['settings', 'awg'], randomizeAwgParams());
++  };
++
++  return (
++    <>
++      <Form.Item label={t('pages.xray.wireguard.secretKey')}>
++        <Space.Compact block>
++          <Form.Item name={['settings', 'secretKey']} noStyle>
++            <Input style={{ width: 'calc(100% - 32px)' }} />
++          </Form.Item>
++          <Button aria-label={t('regenerate')} icon={<ReloadOutlined />} onClick={regenInboundWg} />
++        </Space.Compact>
++      </Form.Item>
++      <Form.Item label={t('pages.xray.wireguard.publicKey')}>
++        <Input value={wgPubKey} disabled />
++      </Form.Item>
++      <Form.Item name={['settings', 'mtu']} label="MTU">
++        <InputNumber />
++      </Form.Item>
++      <Form.Item name={['settings', 'dns']} label={t('pages.inbounds.info.dns')}>
++        <Input placeholder="1.1.1.1, 1.0.0.1" />
++      </Form.Item>
++      <Form.Item
++        name={['settings', 'noKernelTun']}
++        label={t('pages.inbounds.info.noKernelTun')}
++        valuePropName="checked"
++      >
++        <Switch />
++      </Form.Item>
++      <Form.Item name={['settings', 'domainStrategy']} label={t('pages.xray.wireguard.domainStrategy')}>
++        <Select
++          allowClear
++          options={[
++            { value: 'ForceIP', label: 'ForceIP' },
++            { value: 'ForceIPv4', label: 'ForceIPv4' },
++            { value: 'ForceIPv4v6', label: 'ForceIPv4v6' },
++            { value: 'ForceIPv6', label: 'ForceIPv6' },
++            { value: 'ForceIPv6v4', label: 'ForceIPv6v4' },
++          ]}
++        />
++      </Form.Item>
++
++      <Form.Item label={t('pages.xray.amneziawg.title')} extra={t('pages.xray.amneziawg.note')}>
++        <Button icon={<ThunderboltOutlined />} onClick={randomizeAwg}>
++          {t('pages.xray.amneziawg.randomize')}
++        </Button>
++      </Form.Item>
++
++      <Form.Item name={awgPath('jc')} label={t('pages.xray.amneziawg.jc')}>
++        <InputNumber min={0} style={{ width: '100%' }} />
++      </Form.Item>
++      <Form.Item name={awgPath('jmin')} label={t('pages.xray.amneziawg.jmin')}>
++        <InputNumber min={0} style={{ width: '100%' }} />
++      </Form.Item>
++      <Form.Item name={awgPath('jmax')} label={t('pages.xray.amneziawg.jmax')}>
++        <InputNumber min={0} style={{ width: '100%' }} />
++      </Form.Item>
++      <Form.Item name={awgPath('s1')} label={t('pages.xray.amneziawg.s1')}>
++        <InputNumber min={0} style={{ width: '100%' }} />
++      </Form.Item>
++      <Form.Item name={awgPath('s2')} label={t('pages.xray.amneziawg.s2')}>
++        <InputNumber min={0} style={{ width: '100%' }} />
++      </Form.Item>
++
++      <Collapse
++        ghost
++        items={[
++          {
++            key: 'advanced',
++            label: t('pages.xray.amneziawg.advanced'),
++            children: (
++              <>
++                <Form.Item name={awgPath('s3')} label={t('pages.xray.amneziawg.s3')}>
++                  <InputNumber min={0} style={{ width: '100%' }} />
++                </Form.Item>
++                <Form.Item name={awgPath('s4')} label={t('pages.xray.amneziawg.s4')}>
++                  <InputNumber min={0} style={{ width: '100%' }} />
++                </Form.Item>
++                <Form.Item name={awgPath('h1')} label={t('pages.xray.amneziawg.h1')}>
++                  <Input />
++                </Form.Item>
++                <Form.Item name={awgPath('h2')} label={t('pages.xray.amneziawg.h2')}>
++                  <Input />
++                </Form.Item>
++                <Form.Item name={awgPath('h3')} label={t('pages.xray.amneziawg.h3')}>
++                  <Input />
++                </Form.Item>
++                <Form.Item name={awgPath('h4')} label={t('pages.xray.amneziawg.h4')}>
++                  <Input />
++                </Form.Item>
++                <Form.Item name={awgPath('i1')} label={t('pages.xray.amneziawg.i1')}>
++                  <Input />
++                </Form.Item>
++                <Form.Item name={awgPath('i2')} label={t('pages.xray.amneziawg.i2')}>
++                  <Input />
++                </Form.Item>
++                <Form.Item name={awgPath('i3')} label={t('pages.xray.amneziawg.i3')}>
++                  <Input />
++                </Form.Item>
++                <Form.Item name={awgPath('i4')} label={t('pages.xray.amneziawg.i4')}>
++                  <Input />
++                </Form.Item>
++                <Form.Item name={awgPath('i5')} label={t('pages.xray.amneziawg.i5')}>
++                  <Input />
++                </Form.Item>
++              </>
++            ),
++          },
++        ]}
++      />
++    </>
++  );
++}
+diff --git a/frontend/src/pages/inbounds/form/protocols/index.ts b/frontend/src/pages/inbounds/form/protocols/index.ts
+index 455f66c..0b70fb9 100644
+--- a/frontend/src/pages/inbounds/form/protocols/index.ts
++++ b/frontend/src/pages/inbounds/form/protocols/index.ts
+@@ -2,6 +2,7 @@ export { default as TunFields } from './tun';
+ export { default as TunnelFields } from './tunnel';
+ export { default as ShadowsocksFields } from './shadowsocks';
+ export { default as WireguardFields } from './wireguard';
++export { default as AmneziawgFields } from './amneziawg';
+ export { default as HysteriaFields } from './hysteria';
+ export { default as HttpFields } from './http';
+ export { default as MixedFields } from './mixed';
+diff --git a/frontend/src/pages/inbounds/info/InboundInfoModal.tsx b/frontend/src/pages/inbounds/info/InboundInfoModal.tsx
+index 0f2994d..ce72bed 100644
+--- a/frontend/src/pages/inbounds/info/InboundInfoModal.tsx
++++ b/frontend/src/pages/inbounds/info/InboundInfoModal.tsx
+@@ -115,7 +115,7 @@ export default function InboundInfoModal({
+ 
+     const inboundForLinks = inboundFromDb(dbInbound);
+     const fallbackHostname = preferPublicHost(window.location.hostname, subSettings?.publicHost ?? '');
+-    if (info.protocol === Protocols.WIREGUARD) {
++    if (info.protocol === Protocols.WIREGUARD || info.protocol === Protocols.AMNEZIAWG) {
+       setWireguardConfigs(
+         genWireguardConfigs({
+           inbound: inboundForLinks,
+@@ -210,9 +210,9 @@ export default function InboundInfoModal({
+   }, [clientStats, clientSettings]);
+ 
+   const wgPubKey = useMemo(() => {
+-    if (!dbInbound?.isWireguard || !inbound?.settings?.secretKey) return '';
++    if ((!dbInbound?.isWireguard && !dbInbound?.isAmneziawg) || !inbound?.settings?.secretKey) return '';
+     return Wireguard.generateKeypair(inbound.settings.secretKey as string).publicKey;
+-  }, [dbInbound?.isWireguard, inbound?.settings?.secretKey]);
++  }, [dbInbound?.isWireguard, dbInbound?.isAmneziawg, inbound?.settings?.secretKey]);
+ 
+   const formatLastOnline = useCallback(
+     (email: string) => {
+@@ -788,7 +788,7 @@ export default function InboundInfoModal({
+         </dl>
+       )}
+ 
+-      {dbInbound.isWireguard && inbound.settings && (
++      {(dbInbound.isWireguard || dbInbound.isAmneziawg) && inbound.settings && (
+         <>
+           <dl className="info-list info-list-block">
+             <div className="info-row">
+diff --git a/frontend/src/pages/inbounds/info/types.ts b/frontend/src/pages/inbounds/info/types.ts
+index a445ce9..3d6885a 100644
+--- a/frontend/src/pages/inbounds/info/types.ts
++++ b/frontend/src/pages/inbounds/info/types.ts
+@@ -65,6 +65,7 @@ export interface DBInboundLike {
+   isMixed?: boolean;
+   isHTTP?: boolean;
+   isWireguard?: boolean;
++  isAmneziawg?: boolean;
+   settings: unknown;
+   streamSettings: unknown;
+   sniffing: unknown;
+diff --git a/frontend/src/pages/inbounds/list/InboundStatsModal.tsx b/frontend/src/pages/inbounds/list/InboundStatsModal.tsx
+index 3bdb002..7d65b89 100644
+--- a/frontend/src/pages/inbounds/list/InboundStatsModal.tsx
++++ b/frontend/src/pages/inbounds/list/InboundStatsModal.tsx
+@@ -55,7 +55,7 @@ export default function InboundStatsModal({
+           <div className="stat-row">
+             <span className="stat-label">{t('pages.inbounds.protocol')}</span>
+             <Tag color="purple">{record.protocol}</Tag>
+-            {(record.isWireguard || record.isHysteria) && (
++            {(record.isWireguard || record.isAmneziawg || record.isHysteria) && (
+               <Tag color="green">UDP</Tag>
+             )}
+             {record.isSS && (() => {
+diff --git a/frontend/src/pages/inbounds/list/RowActions.tsx b/frontend/src/pages/inbounds/list/RowActions.tsx
+index 6e33d96..a3436c1 100644
+--- a/frontend/src/pages/inbounds/list/RowActions.tsx
++++ b/frontend/src/pages/inbounds/list/RowActions.tsx
+@@ -43,7 +43,7 @@ export function buildRowActionsMenu({ record, subEnable, t, isMobile, hasClients
+         label: `${t('pages.inbounds.export')} — ${t('pages.settings.subSettings')}`,
+       });
+     }
+-  } else if (!record.isWireguard) {
++  } else if (!record.isWireguard && !record.isAmneziawg) {
+     items.push({ key: 'showInfo', icon: <InfoCircleOutlined />, label: t('pages.inbounds.inboundInfo') });
+   }
+   items.push({ key: 'clipboard', icon: <CopyOutlined />, label: t('pages.inbounds.exportInbound') });
+diff --git a/frontend/src/pages/inbounds/list/types.ts b/frontend/src/pages/inbounds/list/types.ts
+index b623e8b..1ca44c3 100644
+--- a/frontend/src/pages/inbounds/list/types.ts
++++ b/frontend/src/pages/inbounds/list/types.ts
+@@ -15,6 +15,7 @@ export type ProtocolFlags = {
+   isMixed?: boolean;
+   isHTTP?: boolean;
+   isWireguard?: boolean;
++  isAmneziawg?: boolean;
+   isTunnel?: boolean;
+ };
+ 
+diff --git a/frontend/src/pages/inbounds/list/useInboundColumns.tsx b/frontend/src/pages/inbounds/list/useInboundColumns.tsx
+index c25d8a4..88d6b1e 100644
+--- a/frontend/src/pages/inbounds/list/useInboundColumns.tsx
++++ b/frontend/src/pages/inbounds/list/useInboundColumns.tsx
+@@ -170,7 +170,7 @@ export function useInboundColumns({
+         width: 190,
+         render: (_, record) => {
+           const tags: ReactElement[] = [<Tag key="p" color="purple">{record.protocol}</Tag>];
+-          if (record.isWireguard || record.isHysteria) {
++          if (record.isWireguard || record.isAmneziawg || record.isHysteria) {
+             tags.push(<Tag key="n" color="green">UDP</Tag>);
+           } else if (record.isSS) {
+             const stream = readStreamHints(record.streamSettings);
+diff --git a/frontend/src/pages/inbounds/qr/QrCodeModal.tsx b/frontend/src/pages/inbounds/qr/QrCodeModal.tsx
+index e8025f7..8c2ae24 100644
+--- a/frontend/src/pages/inbounds/qr/QrCodeModal.tsx
++++ b/frontend/src/pages/inbounds/qr/QrCodeModal.tsx
+@@ -58,7 +58,7 @@ export default function QrCodeModal({
+     if (!open || !dbInbound) return;
+     const inbound = inboundFromDb(dbInbound);
+     const fallbackHostname = preferPublicHost(window.location.hostname, subSettings?.publicHost ?? '');
+-    if (inbound.protocol === Protocols.WIREGUARD) {
++    if (inbound.protocol === Protocols.WIREGUARD || inbound.protocol === Protocols.AMNEZIAWG) {
+       const peerRemark = client?.email
+         ? `${dbInbound.remark}-${client.email}`
+         : dbInbound.remark || '';
+diff --git a/frontend/src/schemas/client.ts b/frontend/src/schemas/client.ts
+index 601d39e..f7a2817 100644
+--- a/frontend/src/schemas/client.ts
++++ b/frontend/src/schemas/client.ts
+@@ -52,6 +52,9 @@ export const InboundOptionSchema = z.object({
+   wgPublicKey: z.string().optional(),
+   wgMtu: z.number().optional(),
+   wgDns: z.string().optional(),
++  // Raw AmneziaWG obfuscation object (jc/jmin/jmax/s1-s4/h1-h4/i1-i5) as JSON;
++  // present only for amneziawg inbounds, used to render the client .conf.
++  awgParams: z.string().optional(),
+   // Hosting node id; absent/null for this panel's own inbounds (#4997).
+   nodeId: z.number().nullable().optional(),
+   // Share-host resolution inputs, mirroring the backend resolveInboundAddress so
+diff --git a/frontend/src/schemas/primitives/protocol.ts b/frontend/src/schemas/primitives/protocol.ts
+index 35cc5c1..8becd33 100644
+--- a/frontend/src/schemas/primitives/protocol.ts
++++ b/frontend/src/schemas/primitives/protocol.ts
+@@ -6,6 +6,7 @@ export const ProtocolSchema = z.enum([
+   'trojan',
+   'shadowsocks',
+   'wireguard',
++  'amneziawg',
+   'hysteria',
+   'http',
+   'mixed',
+@@ -27,6 +28,7 @@ export const Protocols = Object.freeze({
+   TROJAN: 'trojan',
+   SHADOWSOCKS: 'shadowsocks',
+   WIREGUARD: 'wireguard',
++  AMNEZIAWG: 'amneziawg',
+   HYSTERIA: 'hysteria',
+   HTTP: 'http',
+   MIXED: 'mixed',
+diff --git a/frontend/src/schemas/protocols/inbound/amneziawg.ts b/frontend/src/schemas/protocols/inbound/amneziawg.ts
+new file mode 100644
+index 0000000..bbf7b46
+--- /dev/null
++++ b/frontend/src/schemas/protocols/inbound/amneziawg.ts
+@@ -0,0 +1,49 @@
++import { z } from 'zod';
++
++import { WireguardInboundSettingsSchema } from './wireguard';
++
++// AmneziaWG is WireGuard plus packet obfuscation: it reuses the exact same
++// server identity (secretKey/mtu/dns) and per-client model (keypair/allowedIPs/
++// preSharedKey/keepAlive) as WireGuard, and adds an inbound-level obfuscation
++// object (`awg`) whose knobs must match between server and client.
++
++// AntD InputNumber emits null (not undefined) when the user clears a field, and
++// the form store hands that null to safeParse on submit — coalesce it to the
++// 0 default so an unset knob round-trips instead of blocking the save.
++const clearedInt = (schema: z.ZodNumber) =>
++  z.preprocess((v) => (v == null ? 0 : v), schema.default(0));
++
++// The obfuscation parameters mirror the Go awg.Params struct: jc/jmin/jmax
++// (junk packets), s1-s4 (message paddings) are integers (0 = off); h1-h4
++// (magic headers, a uint32 or an "x-y" range) and i1-i5 (optional CPS junk
++// tags, usually left blank in the UI) are strings.
++export const AmneziawgParamsSchema = z.object({
++  jc: clearedInt(z.number().int().min(0)),
++  jmin: clearedInt(z.number().int().min(0)),
++  jmax: clearedInt(z.number().int().min(0)),
++  s1: clearedInt(z.number().int().min(0)),
++  s2: clearedInt(z.number().int().min(0)),
++  s3: clearedInt(z.number().int().min(0)),
++  s4: clearedInt(z.number().int().min(0)),
++  h1: z.string().default(''),
++  h2: z.string().default(''),
++  h3: z.string().default(''),
++  h4: z.string().default(''),
++  i1: z.string().default(''),
++  i2: z.string().default(''),
++  i3: z.string().default(''),
++  i4: z.string().default(''),
++  i5: z.string().default(''),
++});
++export type AmneziawgParams = z.infer<typeof AmneziawgParamsSchema>;
++
++// The inbound settings are the WireGuard settings (secretKey/mtu/dns/peers/
++// clients/noKernelTun/domainStrategy — reused verbatim so the two protocols
++// never drift) plus the optional `awg` obfuscation object and an optional
++// server `address` (a single string or a list, allocated server-side when
++// absent).
++export const AmneziawgInboundSettingsSchema = WireguardInboundSettingsSchema.extend({
++  address: z.union([z.string(), z.array(z.string())]).optional(),
++  awg: AmneziawgParamsSchema.optional(),
++});
++export type AmneziawgInboundSettings = z.infer<typeof AmneziawgInboundSettingsSchema>;
+diff --git a/frontend/src/schemas/protocols/inbound/index.ts b/frontend/src/schemas/protocols/inbound/index.ts
+index 121dd02..067baa1 100644
+--- a/frontend/src/schemas/protocols/inbound/index.ts
++++ b/frontend/src/schemas/protocols/inbound/index.ts
+@@ -1,5 +1,6 @@
+ import { z } from 'zod';
+ 
++import { AmneziawgInboundSettingsSchema } from './amneziawg';
+ import { HttpInboundSettingsSchema } from './http';
+ import { HysteriaInboundSettingsSchema } from './hysteria';
+ import { MixedInboundSettingsSchema } from './mixed';
+@@ -12,6 +13,7 @@ import { VlessInboundSettingsSchema } from './vless';
+ import { VmessInboundSettingsSchema } from './vmess';
+ import { WireguardInboundSettingsSchema } from './wireguard';
+ 
++export * from './amneziawg';
+ export * from './http';
+ export * from './hysteria';
+ export * from './mixed';
+@@ -35,6 +37,7 @@ export const InboundSettingsSchema = z.discriminatedUnion('protocol', [
+   z.object({ protocol: z.literal('trojan'),      settings: TrojanInboundSettingsSchema }),
+   z.object({ protocol: z.literal('shadowsocks'), settings: ShadowsocksInboundSettingsSchema }),
+   z.object({ protocol: z.literal('wireguard'),   settings: WireguardInboundSettingsSchema }),
++  z.object({ protocol: z.literal('amneziawg'),   settings: AmneziawgInboundSettingsSchema }),
+   z.object({ protocol: z.literal('hysteria'),    settings: HysteriaInboundSettingsSchema }),
+   z.object({ protocol: z.literal('http'),        settings: HttpInboundSettingsSchema }),
+   z.object({ protocol: z.literal('mixed'),       settings: MixedInboundSettingsSchema }),
+diff --git a/frontend/src/test/__snapshots__/inbound-full.test.ts.snap b/frontend/src/test/__snapshots__/inbound-full.test.ts.snap
+index 68c6dfc..cdc280e 100644
+--- a/frontend/src/test/__snapshots__/inbound-full.test.ts.snap
++++ b/frontend/src/test/__snapshots__/inbound-full.test.ts.snap
+@@ -1,5 +1,73 @@
+ // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+ 
++exports[`InboundSchema (full) fixtures > parses amneziawg-server byte-stably 1`] = `
++{
++  "down": 0,
++  "enable": true,
++  "expiryTime": 0,
++  "id": 26,
++  "listen": "",
++  "port": 51821,
++  "protocol": "amneziawg",
++  "remark": "awg-server",
++  "settings": {
++    "address": [
++      "10.0.0.1/24",
++    ],
++    "awg": {
++      "h1": "1148618200",
++      "h2": "1148618201",
++      "h3": "1148618202",
++      "h4": "1148618203",
++      "i1": "",
++      "i2": "",
++      "i3": "",
++      "i4": "",
++      "i5": "",
++      "jc": 4,
++      "jmax": 70,
++      "jmin": 40,
++      "s1": 30,
++      "s2": 40,
++      "s3": 0,
++      "s4": 0,
++    },
++    "clients": [],
++    "mtu": 1420,
++    "noKernelTun": false,
++    "peers": [
++      {
++        "allowedIPs": [
++          "10.0.0.2/32",
++        ],
++        "keepAlive": 25,
++        "privateKey": "QGVlb2dXc1ZTWGw0ZXBzZndsWmtMaUM5MUlNYjBHWFdYbz0=",
++        "publicKey": "DGSYIcEKAUkA7HhzGSjxLZuV67BR3LeyU0BMLJzNVHQ=",
++      },
++    ],
++    "secretKey": "iJ2cBkrSGqRwIfYIDIxk7hr5RXfdR93MfJUL7yqkkH8=",
++  },
++  "shareAddr": "",
++  "shareAddrStrategy": "node",
++  "sniffing": {
++    "destOverride": [
++      "http",
++      "tls",
++      "quic",
++      "fakedns",
++    ],
++    "domainsExcluded": [],
++    "enabled": false,
++    "ipsExcluded": [],
++    "metadataOnly": false,
++    "routeOnly": false,
++  },
++  "tag": "inbound-awg-1",
++  "total": 0,
++  "up": 0,
++}
++`;
++
+ exports[`InboundSchema (full) fixtures > parses hysteria-v1-tls byte-stably 1`] = `
+ {
+   "down": 0,
+diff --git a/frontend/src/test/__snapshots__/inbound-link.test.ts.snap b/frontend/src/test/__snapshots__/inbound-link.test.ts.snap
+index 6f1f7f4..f2e1c9f 100644
+--- a/frontend/src/test/__snapshots__/inbound-link.test.ts.snap
++++ b/frontend/src/test/__snapshots__/inbound-link.test.ts.snap
+@@ -2,6 +2,31 @@
+ 
+ exports[`genHysteriaLink > hysteria-v1-tls: byte-stable 1`] = `"hysteria://hyst-v1-auth-XYZ@example.test:36715?security=tls&fp=chrome&alpn=h3&sni=hysteria.example.test#parity-test"`;
+ 
++exports[`genInboundLinks orchestrator > amneziawg-server: byte-stable 1`] = `
++"[Interface]
++PrivateKey = QGVlb2dXc1ZTWGw0ZXBzZndsWmtMaUM5MUlNYjBHWFdYbz0=
++Address = 10.0.0.2/32
++DNS = 1.1.1.1, 1.0.0.1
++MTU = 1420
++Jc = 4
++Jmin = 40
++Jmax = 70
++S1 = 30
++S2 = 40
++H1 = 1148618200
++H2 = 1148618201
++H3 = 1148618202
++H4 = 1148618203
++
++# parity-test-1
++[Peer]
++PublicKey = Piehk2n8UewhMHMyJiBS+Sxn/OK0FalyFW1GAGzokHM=
++AllowedIPs = 0.0.0.0/0, ::/0
++Endpoint = override.test:51821
++PersistentKeepalive = 25
++"
++`;
++
+ exports[`genInboundLinks orchestrator > hysteria-v1-tls: byte-stable 1`] = `"hysteria://hyst-v1-auth-XYZ@override.test:36715?security=tls&fp=chrome&alpn=h3&sni=hysteria.example.test#parity-test"`;
+ 
+ exports[`genInboundLinks orchestrator > shadowsocks-tcp-2022: byte-stable 1`] = `"ss://2022-blake3-aes-256-gcm:ZmFrZS1zZXJ2ZXItcGFzc3dvcmQtMDAwMQ%3D%3D:dGVzdC1jbGllbnQtcGFzc3dvcmQtMQ%3D%3D@override.test:8388?type=tcp#parity-test"`;
+diff --git a/frontend/src/test/__snapshots__/protocol-capabilities.test.ts.snap b/frontend/src/test/__snapshots__/protocol-capabilities.test.ts.snap
+index d410e1c..4303062 100644
+--- a/frontend/src/test/__snapshots__/protocol-capabilities.test.ts.snap
++++ b/frontend/src/test/__snapshots__/protocol-capabilities.test.ts.snap
+@@ -1,5 +1,173 @@
+ // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+ 
++exports[`protocol capability predicates > amneziawg-basic :: grpc/none 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: grpc/reality 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: grpc/tls 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: httpupgrade/none 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: httpupgrade/tls 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: kcp/none 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: tcp/none 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: tcp/reality 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: tcp/tls 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: ws/none 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: ws/tls 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: xhttp/none 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: xhttp/reality 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
++exports[`protocol capability predicates > amneziawg-basic :: xhttp/tls 1`] = `
++{
++  "canEnableReality": false,
++  "canEnableStream": true,
++  "canEnableTls": false,
++  "canEnableTlsFlow": false,
++  "canEnableVisionSeed": false,
++  "isSS2022": false,
++  "isSSMultiUser": true,
++}
++`;
++
+ exports[`protocol capability predicates > http-basic :: grpc/none 1`] = `
+ {
+   "canEnableReality": false,
+diff --git a/frontend/src/test/__snapshots__/protocols.test.ts.snap b/frontend/src/test/__snapshots__/protocols.test.ts.snap
+index aea5d4d..64ba52d 100644
+--- a/frontend/src/test/__snapshots__/protocols.test.ts.snap
++++ b/frontend/src/test/__snapshots__/protocols.test.ts.snap
+@@ -1,5 +1,48 @@
+ // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+ 
++exports[`InboundSettingsSchema fixtures > parses amneziawg-basic byte-stably 1`] = `
++{
++  "protocol": "amneziawg",
++  "settings": {
++    "address": [
++      "10.0.0.1/24",
++    ],
++    "awg": {
++      "h1": "1148618200",
++      "h2": "1148618201",
++      "h3": "1148618202",
++      "h4": "1148618203",
++      "i1": "",
++      "i2": "",
++      "i3": "",
++      "i4": "",
++      "i5": "",
++      "jc": 4,
++      "jmax": 70,
++      "jmin": 40,
++      "s1": 30,
++      "s2": 40,
++      "s3": 0,
++      "s4": 0,
++    },
++    "clients": [],
++    "mtu": 1420,
++    "noKernelTun": false,
++    "peers": [
++      {
++        "allowedIPs": [
++          "10.0.0.2/32",
++        ],
++        "keepAlive": 25,
++        "privateKey": "iJ2cBkrSGqRwIfYIDIxk7hr5RXfdR93MfJUL7yqkkH8=",
++        "publicKey": "DGSYIcEKAUkA7HhzGSjxLZuV67BR3LeyU0BMLJzNVHQ=",
++      },
++    ],
++    "secretKey": "QGVlb2dXc1ZTWGw0ZXBzZndsWmtMaUM5MUlNYjBHWFdYbz0=",
++  },
++}
++`;
++
+ exports[`InboundSettingsSchema fixtures > parses http-basic byte-stably 1`] = `
+ {
+   "protocol": "http",
+diff --git a/frontend/src/test/golden/fixtures/inbound-full/amneziawg-server.json b/frontend/src/test/golden/fixtures/inbound-full/amneziawg-server.json
+new file mode 100644
+index 0000000..c90bdea
+--- /dev/null
++++ b/frontend/src/test/golden/fixtures/inbound-full/amneziawg-server.json
+@@ -0,0 +1,53 @@
++{
++  "id": 26,
++  "up": 0,
++  "down": 0,
++  "total": 0,
++  "remark": "awg-server",
++  "enable": true,
++  "expiryTime": 0,
++  "listen": "",
++  "port": 51821,
++  "tag": "inbound-awg-1",
++  "sniffing": {
++    "enabled": false,
++    "destOverride": ["http", "tls", "quic", "fakedns"],
++    "metadataOnly": false,
++    "routeOnly": false,
++    "ipsExcluded": [],
++    "domainsExcluded": []
++  },
++  "protocol": "amneziawg",
++  "settings": {
++    "mtu": 1420,
++    "secretKey": "iJ2cBkrSGqRwIfYIDIxk7hr5RXfdR93MfJUL7yqkkH8=",
++    "address": ["10.0.0.1/24"],
++    "peers": [
++      {
++        "privateKey": "QGVlb2dXc1ZTWGw0ZXBzZndsWmtMaUM5MUlNYjBHWFdYbz0=",
++        "publicKey": "DGSYIcEKAUkA7HhzGSjxLZuV67BR3LeyU0BMLJzNVHQ=",
++        "allowedIPs": ["10.0.0.2/32"],
++        "keepAlive": 25
++      }
++    ],
++    "noKernelTun": false,
++    "awg": {
++      "jc": 4,
++      "jmin": 40,
++      "jmax": 70,
++      "s1": 30,
++      "s2": 40,
++      "s3": 0,
++      "s4": 0,
++      "h1": "1148618200",
++      "h2": "1148618201",
++      "h3": "1148618202",
++      "h4": "1148618203",
++      "i1": "",
++      "i2": "",
++      "i3": "",
++      "i4": "",
++      "i5": ""
++    }
++  }
++}
+diff --git a/frontend/src/test/golden/fixtures/inbound/amneziawg-basic.json b/frontend/src/test/golden/fixtures/inbound/amneziawg-basic.json
+new file mode 100644
+index 0000000..0adacfe
+--- /dev/null
++++ b/frontend/src/test/golden/fixtures/inbound/amneziawg-basic.json
+@@ -0,0 +1,35 @@
++{
++  "protocol": "amneziawg",
++  "settings": {
++    "mtu": 1420,
++    "secretKey": "QGVlb2dXc1ZTWGw0ZXBzZndsWmtMaUM5MUlNYjBHWFdYbz0=",
++    "address": ["10.0.0.1/24"],
++    "peers": [
++      {
++        "privateKey": "iJ2cBkrSGqRwIfYIDIxk7hr5RXfdR93MfJUL7yqkkH8=",
++        "publicKey": "DGSYIcEKAUkA7HhzGSjxLZuV67BR3LeyU0BMLJzNVHQ=",
++        "allowedIPs": ["10.0.0.2/32"],
++        "keepAlive": 25
++      }
++    ],
++    "noKernelTun": false,
++    "awg": {
++      "jc": 4,
++      "jmin": 40,
++      "jmax": 70,
++      "s1": 30,
++      "s2": 40,
++      "s3": 0,
++      "s4": 0,
++      "h1": "1148618200",
++      "h2": "1148618201",
++      "h3": "1148618202",
++      "h4": "1148618203",
++      "i1": "",
++      "i2": "",
++      "i3": "",
++      "i4": "",
++      "i5": ""
++    }
++  }
++}
+diff --git a/frontend/src/test/inbound-defaults.test.ts b/frontend/src/test/inbound-defaults.test.ts
+index 9bfb317..2a3a8a2 100644
+--- a/frontend/src/test/inbound-defaults.test.ts
++++ b/frontend/src/test/inbound-defaults.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, it } from 'vitest';
+ 
+ import {
++  createDefaultAmneziawgInboundSettings,
+   createDefaultHttpInboundSettings,
+   createDefaultHysteriaClient,
+   createDefaultHysteriaInboundSettings,
+@@ -16,6 +17,7 @@ import {
+   createDefaultVmessInboundSettings,
+   createDefaultWireguardInboundSettings,
+ } from '@/lib/xray/inbound-defaults';
++import { AmneziawgInboundSettingsSchema } from '@/schemas/protocols/inbound/amneziawg';
+ import { createHysteriaTlsSettingsWithDefaultCert } from '@/lib/xray/inbound-tls-defaults';
+ import { HttpInboundSettingsSchema } from '@/schemas/protocols/inbound/http';
+ import { HysteriaClientSchema, HysteriaInboundSettingsSchema } from '@/schemas/protocols/inbound/hysteria';
+@@ -148,6 +150,29 @@ describe('createDefault*InboundSettings factories', () => {
+     expect(s.peers).toEqual([]);
+     expect(s.clients).toEqual([]);
+   });
++
++  it('amneziawg (wireguard defaults + randomized obfuscation)', () => {
++    const s = createDefaultAmneziawgInboundSettings({
++      secretKey: 'QGVlb2dXc1ZTWGw0ZXBzZndsWmtMaUM5MUlNYjBHWFdYbz0=',
++    });
++    // The awg object is randomized, so assert the shape/ranges rather than
++    // snapshotting; parse must still round-trip the exact object.
++    expect(AmneziawgInboundSettingsSchema.parse(s)).toEqual(s);
++    expect(s.peers).toEqual([]);
++    expect(s.clients).toEqual([]);
++    expect(s.mtu).toBe(1420);
++    const awg = s.awg!;
++    expect(awg.jc).toBeGreaterThanOrEqual(3);
++    expect(awg.jc).toBeLessThanOrEqual(10);
++    expect(awg.jmax).toBeGreaterThanOrEqual(awg.jmin + 20);
++    expect(awg.s3).toBe(0);
++    expect(awg.s4).toBe(0);
++    // Four distinct magic headers above WireGuard's reserved 1-4.
++    const headers = [awg.h1, awg.h2, awg.h3, awg.h4];
++    expect(new Set(headers).size).toBe(4);
++    for (const h of headers) expect(Number(h)).toBeGreaterThan(4);
++    expect([awg.i1, awg.i2, awg.i3, awg.i4, awg.i5]).toEqual(['', '', '', '', '']);
++  });
+ });
+ 
+ describe('createHysteriaTlsSettingsWithDefaultCert', () => {
+diff --git a/frontend/src/test/wireguard-client-config.test.ts b/frontend/src/test/wireguard-client-config.test.ts
+index be1be7f..13e63e8 100644
+--- a/frontend/src/test/wireguard-client-config.test.ts
++++ b/frontend/src/test/wireguard-client-config.test.ts
+@@ -89,4 +89,36 @@ describe('buildWireguardClientConfig', () => {
+     expect(cfg).toContain('Endpoint = wg_gw.corp.lan:51820');
+     expect(cfg).not.toContain('Endpoint = :51820');
+   });
++
++  it('appends AmneziaWG [Interface] obfuscation keys when the inbound carries awgParams', () => {
++    const awgInbound: InboundOption = {
++      ...inbound,
++      protocol: 'amneziawg',
++      awgParams: JSON.stringify({
++        jc: 4, jmin: 40, jmax: 70, s1: 30, s2: 40, s3: 0, s4: 0,
++        h1: '1148618200', h2: '1148618201', h3: '1148618202', h4: '1148618203',
++        i1: '', i2: '', i3: '', i4: '', i5: '',
++      }),
++    };
++    const cfg = buildWireguardClientConfig(client, awgInbound, 'example.com', '');
++    // Jc/Jmin/Jmax + S1/S2 + H1-H4 emitted; S3/S4 and I1-I5 (0/'') omitted.
++    expect(cfg).toContain('Jc = 4');
++    expect(cfg).toContain('Jmin = 40');
++    expect(cfg).toContain('Jmax = 70');
++    expect(cfg).toContain('S1 = 30');
++    expect(cfg).toContain('S2 = 40');
++    expect(cfg).toContain('H1 = 1148618200');
++    expect(cfg).toContain('H4 = 1148618203');
++    expect(cfg).not.toContain('S3 =');
++    expect(cfg).not.toContain('S4 =');
++    expect(cfg).not.toContain('I1 =');
++    // Obfuscation keys live in [Interface], before the [Peer] block.
++    expect(cfg.indexOf('Jc = 4')).toBeLessThan(cfg.indexOf('[Peer]'));
++  });
++
++  it('emits no AWG keys for a plain wireguard inbound (no awgParams)', () => {
++    const cfg = buildWireguardClientConfig(client, inbound, 'example.com', '');
++    expect(cfg).not.toContain('Jc =');
++    expect(cfg).not.toContain('H1 =');
++  });
+ });
+diff --git a/go.mod b/go.mod
+index 38f1a7d..947dd40 100644
+--- a/go.mod
++++ b/go.mod
+@@ -3,6 +3,7 @@ module github.com/mhsanaei/3x-ui/v3
+ go 1.26.4
+ 
+ require (
++	github.com/amnezia-vpn/amneziawg-go v1.0.4
+ 	github.com/gin-contrib/gzip v1.2.6
+ 	github.com/gin-contrib/sessions v1.1.0
+ 	github.com/gin-gonic/gin v1.12.0
+@@ -34,6 +35,8 @@ require (
+ 	pgregory.net/rapid v1.3.0
+ )
+ 
++require github.com/tevino/abool v1.2.0 // indirect
++
+ require (
+ 	github.com/Azure/go-ntlmssp v0.1.1 // indirect
+ 	github.com/andybalholm/brotli v1.2.1 // indirect
+@@ -110,6 +113,6 @@ require (
+ 	golang.zx2c4.com/wireguard/windows v1.0.1 // indirect
+ 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260622175928-b703f567277d // indirect
+ 	google.golang.org/protobuf v1.36.11
+-	gvisor.dev/gvisor v0.0.0-20260122175437-89a5d21be8f0 // indirect
++	gvisor.dev/gvisor v0.0.0-20260122175437-89a5d21be8f0
+ 	lukechampine.com/blake3 v1.4.1 // indirect
+ )
+diff --git a/go.sum b/go.sum
+index 59722ed..c7ca62f 100644
+--- a/go.sum
++++ b/go.sum
+@@ -4,6 +4,8 @@ github.com/BurntSushi/toml v1.6.0 h1:dRaEfpa2VI55EwlIW72hMRHdWouJeRF7TPYhI+AUQjk
+ github.com/BurntSushi/toml v1.6.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
+ github.com/alexbrainman/sspi v0.0.0-20250919150558-7d374ff0d59e h1:4dAU9FXIyQktpoUAgOJK3OTFc/xug0PCXYCqU0FgDKI=
+ github.com/alexbrainman/sspi v0.0.0-20250919150558-7d374ff0d59e/go.mod h1:cEWa1LVoE5KvSD9ONXsZrj0z6KqySlCCNKHlLzbqAt4=
++github.com/amnezia-vpn/amneziawg-go v1.0.4 h1:hyS3dEY+znvfGVZznYdLWaKGPBwJzGqJLuO/9s3sTok=
++github.com/amnezia-vpn/amneziawg-go v1.0.4/go.mod h1:uD0Cz0XbnhE0k1vpJZiUq47YDP5vne9FtV9Bc1lQJEs=
+ github.com/andybalholm/brotli v1.2.1 h1:R+f5xP285VArJDRgowrfb9DqL18yVK0gKAW/F+eTWro=
+ github.com/andybalholm/brotli v1.2.1/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
+ github.com/apernet/quic-go v0.59.1-0.20260425001925-6c6cc9bcb716 h1:J1O+xpLuJWkdYbw5JPGwBqIHs2J8tiEP7Py9lPqkN2I=
+@@ -194,6 +196,8 @@ github.com/stretchr/testify v1.8.4/go.mod h1:sz/lmYIOXD/1dqDmKjjqLyZ2RngseejIcXl
+ github.com/stretchr/testify v1.10.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
+ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
+ github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
++github.com/tevino/abool v1.2.0 h1:heAkClL8H6w+mK5md9dzsuohKeXHUpY7Vw0ZCKW+huA=
++github.com/tevino/abool v1.2.0/go.mod h1:qc66Pna1RiIsPa7O4Egxxs9OqkuxDX55zznh9K07Tzg=
+ github.com/tklauser/go-sysconf v0.4.0 h1:7H0uAN+7RkwWRaxhYXDLqa5V3LPrJeV8wmD9dRUgPQU=
+ github.com/tklauser/go-sysconf v0.4.0/go.mod h1:8mTNWyog7H+MpKijp4VmKJAd2bbYQ2zuUwkYRbUArPI=
+ github.com/tklauser/numcpus v0.12.0 h1:NR85qdvHA9pFse3x3weVZ0r0ST8R6l5RHbZrlRaqob4=
+diff --git a/internal/awg/config.go b/internal/awg/config.go
+new file mode 100644
+index 0000000..b76858c
+--- /dev/null
++++ b/internal/awg/config.go
+@@ -0,0 +1,301 @@
++package awg
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/netip"
++	"strconv"
++	"strings"
++
++	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
++	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
++)
++
++const (
++	defaultMTU          = 1420
++	defaultServerAddr   = "10.0.0.1/24"
++	defaultClientDNS    = "1.1.1.1, 1.0.0.1"
++	defaultAllowedIPs   = "0.0.0.0/0, ::/0"
++	defaultKeepAliveSec = 25
++)
++
++// Peer is one accepted AmneziaWG client device, projected from a managed
++// inbound client. Email is carried only for traffic attribution.
++type Peer struct {
++	Email        string
++	PublicKey    string
++	PreSharedKey string
++	AllowedIPs   []string
++	KeepAlive    int
++}
++
++// Instance is the desired runtime state of one AmneziaWG inbound: everything
++// needed to stand up the in-process device and its peers.
++type Instance struct {
++	Id         int
++	Tag        string
++	ListenPort int
++	SecretKey  string
++	Mtu        int
++	Addresses  []netip.Prefix
++	Params     Params
++	Peers      []Peer
++}
++
++type awgInboundSettings struct {
++	SecretKey string          `json:"secretKey"`
++	MTU       int             `json:"mtu"`
++	DNS       string          `json:"dns"`
++	Address   json.RawMessage `json:"address"`
++	AWG       *Params         `json:"awg"`
++	Clients   []model.Client  `json:"clients"`
++}
++
++// InstanceFromInbound parses an AmneziaWG inbound's settings JSON into a desired
++// Instance. It returns false when the inbound is not AmneziaWG or has no server
++// secret key (nothing to run).
++func InstanceFromInbound(ib *model.Inbound) (Instance, bool) {
++	if ib == nil || ib.Protocol != model.AmneziaWG {
++		return Instance{}, false
++	}
++	var s awgInboundSettings
++	if err := json.Unmarshal([]byte(ib.Settings), &s); err != nil {
++		return Instance{}, false
++	}
++	if strings.TrimSpace(s.SecretKey) == "" {
++		return Instance{}, false
++	}
++	mtu := s.MTU
++	if mtu <= 0 {
++		mtu = defaultMTU
++	}
++	inst := Instance{
++		Id:         ib.Id,
++		Tag:        ib.Tag,
++		ListenPort: ib.Port,
++		SecretKey:  strings.TrimSpace(s.SecretKey),
++		Mtu:        mtu,
++		Addresses:  parseServerAddresses(s.Address, s.Clients),
++	}
++	if s.AWG != nil {
++		inst.Params = *s.AWG
++	}
++	for i := range s.Clients {
++		c := s.Clients[i]
++		if !c.Enable || strings.TrimSpace(c.PublicKey) == "" {
++			continue
++		}
++		inst.Peers = append(inst.Peers, Peer{
++			Email:        c.Email,
++			PublicKey:    c.PublicKey,
++			PreSharedKey: c.PreSharedKey,
++			AllowedIPs:   c.AllowedIPs,
++			KeepAlive:    c.KeepAlive,
++		})
++	}
++	return inst, true
++}
++
++// parseServerAddresses resolves the tunnel address(es) the device answers for.
++// It honours an explicit settings.address (string or array), otherwise derives
++// the .1 host of the clients' /24, otherwise falls back to 10.0.0.1/24.
++func parseServerAddresses(raw json.RawMessage, clients []model.Client) []netip.Prefix {
++	for _, s := range decodeStringOrArray(raw) {
++		if p, err := netip.ParsePrefix(strings.TrimSpace(s)); err == nil {
++			return []netip.Prefix{p}
++		}
++		if a, err := netip.ParseAddr(strings.TrimSpace(s)); err == nil {
++			return []netip.Prefix{netip.PrefixFrom(a, a.BitLen())}
++		}
++	}
++	for _, c := range clients {
++		for _, ip := range c.AllowedIPs {
++			if a := hostAddr(ip); a.IsValid() && a.Is4() {
++				if base, err := a.Prefix(24); err == nil {
++					return []netip.Prefix{netip.PrefixFrom(base.Addr().Next(), 24)}
++				}
++			}
++		}
++	}
++	p := netip.MustParsePrefix(defaultServerAddr)
++	return []netip.Prefix{p}
++}
++
++func decodeStringOrArray(raw json.RawMessage) []string {
++	if len(raw) == 0 {
++		return nil
++	}
++	var arr []string
++	if err := json.Unmarshal(raw, &arr); err == nil {
++		return arr
++	}
++	var one string
++	if err := json.Unmarshal(raw, &one); err == nil && one != "" {
++		return []string{one}
++	}
++	return nil
++}
++
++func hostAddr(s string) netip.Addr {
++	s = strings.TrimSpace(s)
++	if p, err := netip.ParsePrefix(s); err == nil {
++		return p.Addr()
++	}
++	if a, err := netip.ParseAddr(s); err == nil {
++		return a
++	}
++	return netip.Addr{}
++}
++
++// localAddrs returns the tunnel addresses as bare netip.Addr for the netstack.
++func (inst Instance) localAddrs() []netip.Addr {
++	out := make([]netip.Addr, 0, len(inst.Addresses))
++	for _, p := range inst.Addresses {
++		out = append(out, p.Addr())
++	}
++	return out
++}
++
++// uapiConfig renders the full amneziawg-go IpcSet payload: the server private
++// key, listen port, obfuscation params, and every peer. Keys are hex-encoded as
++// the WireGuard UAPI requires.
++func (inst Instance) uapiConfig() (string, error) {
++	privHex, err := wgutil.KeyToHex(inst.SecretKey)
++	if err != nil {
++		return "", fmt.Errorf("awg: bad server secret key: %w", err)
++	}
++	var sb strings.Builder
++	sb.WriteString("private_key=" + privHex + "\n")
++	fmt.Fprintf(&sb, "listen_port=%d\n", inst.ListenPort)
++	inst.Params.appendUAPILines(&sb)
++	if err := inst.appendPeers(&sb); err != nil {
++		return "", err
++	}
++	return sb.String(), nil
++}
++
++// peersUAPIConfig renders only the peer set, prefixed with replace_peers so a
++// live IpcSet replaces the device's peers without a restart (used when clients
++// change but the device parameters do not).
++func (inst Instance) peersUAPIConfig() (string, error) {
++	var sb strings.Builder
++	if err := inst.appendPeers(&sb); err != nil {
++		return "", err
++	}
++	return sb.String(), nil
++}
++
++func (inst Instance) appendPeers(sb *strings.Builder) error {
++	sb.WriteString("replace_peers=true\n")
++	for _, peer := range inst.Peers {
++		pubHex, err := wgutil.KeyToHex(peer.PublicKey)
++		if err != nil {
++			return fmt.Errorf("awg: bad peer public key for %s: %w", peer.Email, err)
++		}
++		sb.WriteString("public_key=" + pubHex + "\n")
++		if peer.PreSharedKey != "" {
++			pskHex, err := wgutil.KeyToHex(peer.PreSharedKey)
++			if err != nil {
++				return fmt.Errorf("awg: bad preshared key for %s: %w", peer.Email, err)
++			}
++			sb.WriteString("preshared_key=" + pskHex + "\n")
++		}
++		sb.WriteString("replace_allowed_ips=true\n")
++		for _, ip := range peer.AllowedIPs {
++			ip = strings.TrimSpace(ip)
++			if ip == "" {
++				continue
++			}
++			if !strings.Contains(ip, "/") {
++				if a := hostAddr(ip); a.IsValid() {
++					ip = netip.PrefixFrom(a, a.BitLen()).String()
++				}
++			}
++			sb.WriteString("allowed_ip=" + ip + "\n")
++		}
++		if peer.KeepAlive > 0 {
++			fmt.Fprintf(sb, "persistent_keepalive_interval=%d\n", peer.KeepAlive)
++		}
++	}
++	return nil
++}
++
++// deviceFingerprint captures the values that require a full device restart when
++// they change (listen port, server key, MTU, obfuscation params, addresses).
++func (inst Instance) deviceFingerprint() string {
++	parts := []string{
++		strconv.Itoa(inst.ListenPort), inst.SecretKey, strconv.Itoa(inst.Mtu),
++		inst.Params.fingerprint(),
++	}
++	for _, p := range inst.Addresses {
++		parts = append(parts, p.String())
++	}
++	return strings.Join(parts, "|")
++}
++
++// peersFingerprint captures the peer set so a client add/remove/edit can be
++// applied live without restarting the device.
++func (inst Instance) peersFingerprint() string {
++	parts := make([]string, 0, len(inst.Peers))
++	for _, peer := range inst.Peers {
++		parts = append(parts, peer.PublicKey+","+peer.PreSharedKey+","+strings.Join(peer.AllowedIPs, ",")+","+strconv.Itoa(peer.KeepAlive))
++	}
++	return strings.Join(parts, "|")
++}
++
++// ClientConfigOptions carries everything needed to render one client .conf.
++type ClientConfigOptions struct {
++	PrivateKey      string
++	Address         string
++	DNS             string
++	MTU             int
++	Params          Params
++	ServerPublicKey string
++	PreSharedKey    string
++	Endpoint        string
++	AllowedIPs      string
++	KeepAlive       int
++	Remark          string
++}
++
++// BuildClientConfig renders an AmneziaWG client .conf. It is a standard
++// wg-quick file plus the obfuscation keys, importable by the AmneziaWG apps.
++func BuildClientConfig(opts ClientConfigOptions) string {
++	address := opts.Address
++	if strings.TrimSpace(address) == "" {
++		address = "10.0.0.2/32"
++	}
++	dns := opts.DNS
++	if strings.TrimSpace(dns) == "" {
++		dns = defaultClientDNS
++	}
++	allowed := opts.AllowedIPs
++	if strings.TrimSpace(allowed) == "" {
++		allowed = defaultAllowedIPs
++	}
++	var sb strings.Builder
++	if r := strings.TrimSpace(opts.Remark); r != "" {
++		sb.WriteString("# " + r + "\n")
++	}
++	sb.WriteString("[Interface]\n")
++	sb.WriteString("PrivateKey = " + opts.PrivateKey + "\n")
++	sb.WriteString("Address = " + address + "\n")
++	sb.WriteString("DNS = " + dns + "\n")
++	if opts.MTU > 0 {
++		fmt.Fprintf(&sb, "MTU = %d\n", opts.MTU)
++	}
++	opts.Params.appendConfLines(&sb)
++	sb.WriteString("\n[Peer]\n")
++	sb.WriteString("PublicKey = " + opts.ServerPublicKey + "\n")
++	if strings.TrimSpace(opts.PreSharedKey) != "" {
++		sb.WriteString("PresharedKey = " + opts.PreSharedKey + "\n")
++	}
++	sb.WriteString("AllowedIPs = " + allowed + "\n")
++	sb.WriteString("Endpoint = " + opts.Endpoint + "\n")
++	keepAlive := opts.KeepAlive
++	if keepAlive <= 0 {
++		keepAlive = defaultKeepAliveSec
++	}
++	fmt.Fprintf(&sb, "PersistentKeepalive = %d\n", keepAlive)
++	return sb.String()
++}
+diff --git a/internal/awg/config_test.go b/internal/awg/config_test.go
+new file mode 100644
+index 0000000..6ea6dec
+--- /dev/null
++++ b/internal/awg/config_test.go
+@@ -0,0 +1,197 @@
++package awg
++
++import (
++	"encoding/json"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
++	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
++)
++
++func mustKeypair(t *testing.T) (priv, pub string) {
++	t.Helper()
++	priv, pub, err := wgutil.GenerateWireguardKeypair()
++	if err != nil {
++		t.Fatalf("keypair: %v", err)
++	}
++	return priv, pub
++}
++
++func buildInbound(t *testing.T, secret string, clients []map[string]any, awgParams map[string]any) *model.Inbound {
++	t.Helper()
++	settings := map[string]any{
++		"secretKey": secret,
++		"mtu":       1420,
++		"dns":       "1.1.1.1",
++		"clients":   clients,
++	}
++	if awgParams != nil {
++		settings["awg"] = awgParams
++	}
++	raw, err := json.Marshal(settings)
++	if err != nil {
++		t.Fatalf("marshal: %v", err)
++	}
++	return &model.Inbound{
++		Id:       7,
++		Tag:      "inbound-7",
++		Port:     51820,
++		Protocol: model.AmneziaWG,
++		Settings: string(raw),
++	}
++}
++
++func TestInstanceFromInboundFiltersPeers(t *testing.T) {
++	serverPriv, _ := mustKeypair(t)
++	_, pub1 := mustKeypair(t)
++	_, pub2 := mustKeypair(t)
++
++	clients := []map[string]any{
++		{"email": "alice", "enable": true, "publicKey": pub1, "allowedIPs": []string{"10.0.0.2/32"}, "keepAlive": 25},
++		{"email": "bob-disabled", "enable": false, "publicKey": pub2, "allowedIPs": []string{"10.0.0.3/32"}},
++		{"email": "carol-nokey", "enable": true, "publicKey": "", "allowedIPs": []string{"10.0.0.4/32"}},
++	}
++	awgParams := map[string]any{"jc": 4, "jmin": 40, "jmax": 70, "s1": 30, "s2": 40, "h1": "10", "h2": "20", "h3": "30", "h4": "40"}
++	ib := buildInbound(t, serverPriv, clients, awgParams)
++
++	inst, ok := InstanceFromInbound(ib)
++	if !ok {
++		t.Fatal("InstanceFromInbound returned not ok")
++	}
++	if len(inst.Peers) != 1 {
++		t.Fatalf("expected 1 enabled peer with key, got %d", len(inst.Peers))
++	}
++	if inst.Peers[0].Email != "alice" {
++		t.Fatalf("expected alice, got %q", inst.Peers[0].Email)
++	}
++	if inst.ListenPort != 51820 || inst.Mtu != 1420 {
++		t.Fatalf("unexpected listen/mtu: %d/%d", inst.ListenPort, inst.Mtu)
++	}
++	if inst.Params.Jc != 4 || inst.Params.H1 != "10" {
++		t.Fatalf("params not parsed: %+v", inst.Params)
++	}
++	if len(inst.Addresses) == 0 || !strings.HasPrefix(inst.Addresses[0].String(), "10.0.0.1") {
++		t.Fatalf("server address should derive to 10.0.0.1, got %v", inst.Addresses)
++	}
++}
++
++func TestInstanceFromInboundRejectsWrongProtocolAndNoKey(t *testing.T) {
++	if _, ok := InstanceFromInbound(&model.Inbound{Protocol: model.WireGuard}); ok {
++		t.Fatal("wireguard inbound should not parse as amneziawg")
++	}
++	ib := &model.Inbound{Protocol: model.AmneziaWG, Settings: `{"mtu":1420}`}
++	if _, ok := InstanceFromInbound(ib); ok {
++		t.Fatal("amneziawg inbound without secretKey should not parse")
++	}
++}
++
++func TestUAPIConfigHexAndPeers(t *testing.T) {
++	serverPriv, _ := mustKeypair(t)
++	_, pub1 := mustKeypair(t)
++	clients := []map[string]any{
++		{"email": "alice", "enable": true, "publicKey": pub1, "allowedIPs": []string{"10.0.0.2/32"}, "keepAlive": 25},
++	}
++	ib := buildInbound(t, serverPriv, clients, map[string]any{"jc": 3, "jmin": 40, "jmax": 70})
++	inst, ok := InstanceFromInbound(ib)
++	if !ok {
++		t.Fatal("not ok")
++	}
++	uapi, err := inst.uapiConfig()
++	if err != nil {
++		t.Fatalf("uapiConfig: %v", err)
++	}
++	privHex, _ := wgutil.KeyToHex(serverPriv)
++	pubHex, _ := wgutil.KeyToHex(pub1)
++	for _, want := range []string{
++		"private_key=" + privHex + "\n",
++		"listen_port=51820\n",
++		"jc=3\n",
++		"replace_peers=true\n",
++		"public_key=" + pubHex + "\n",
++		"allowed_ip=10.0.0.2/32\n",
++		"persistent_keepalive_interval=25\n",
++	} {
++		if !strings.Contains(uapi, want) {
++			t.Fatalf("uapi missing %q in:\n%s", want, uapi)
++		}
++	}
++	if strings.Contains(uapi, serverPriv) {
++		t.Fatal("uapi must use hex keys, not the base64 form")
++	}
++}
++
++func TestBuildClientConfig(t *testing.T) {
++	conf := BuildClientConfig(ClientConfigOptions{
++		PrivateKey:      "CLIENTPRIV",
++		Address:         "10.0.0.2/32",
++		DNS:             "1.1.1.1",
++		MTU:             1420,
++		Params:          Params{Jc: 4, Jmin: 40, Jmax: 70, S1: 30, S2: 40, H1: "10", H2: "20", H3: "30", H4: "40"},
++		ServerPublicKey: "SERVERPUB",
++		PreSharedKey:    "PSK",
++		Endpoint:        "vpn.example.com:51820",
++		Remark:          "inbound-7 - alice",
++	})
++	for _, want := range []string{
++		"[Interface]",
++		"PrivateKey = CLIENTPRIV",
++		"Address = 10.0.0.2/32",
++		"DNS = 1.1.1.1",
++		"MTU = 1420",
++		"Jc = 4",
++		"H1 = 10",
++		"[Peer]",
++		"PublicKey = SERVERPUB",
++		"PresharedKey = PSK",
++		"AllowedIPs = 0.0.0.0/0, ::/0",
++		"Endpoint = vpn.example.com:51820",
++		"PersistentKeepalive = 25",
++		"# inbound-7 - alice",
++	} {
++		if !strings.Contains(conf, want) {
++			t.Fatalf("client conf missing %q in:\n%s", want, conf)
++		}
++	}
++}
++
++func TestFingerprintsSplitDeviceAndPeers(t *testing.T) {
++	serverPriv, _ := mustKeypair(t)
++	_, pub1 := mustKeypair(t)
++	_, pub2 := mustKeypair(t)
++	base := []map[string]any{
++		{"email": "alice", "enable": true, "publicKey": pub1, "allowedIPs": []string{"10.0.0.2/32"}},
++	}
++	inst1, _ := InstanceFromInbound(buildInbound(t, serverPriv, base, nil))
++
++	withPeer := append([]map[string]any{}, base...)
++	withPeer = append(withPeer, map[string]any{"email": "bob", "enable": true, "publicKey": pub2, "allowedIPs": []string{"10.0.0.3/32"}})
++	inst2, _ := InstanceFromInbound(buildInbound(t, serverPriv, withPeer, nil))
++
++	if inst1.deviceFingerprint() != inst2.deviceFingerprint() {
++		t.Fatal("adding a peer must not change the device fingerprint")
++	}
++	if inst1.peersFingerprint() == inst2.peersFingerprint() {
++		t.Fatal("adding a peer must change the peers fingerprint")
++	}
++
++	inst3, _ := InstanceFromInbound(buildInbound(t, serverPriv, base, map[string]any{"jc": 5, "jmin": 40, "jmax": 70}))
++	if inst1.deviceFingerprint() == inst3.deviceFingerprint() {
++		t.Fatal("changing obfuscation params must change the device fingerprint")
++	}
++}
++
++func ExampleBuildClientConfig() {
++	conf := BuildClientConfig(ClientConfigOptions{
++		PrivateKey:      "priv",
++		Address:         "10.0.0.2/32",
++		DNS:             "1.1.1.1",
++		Params:          Params{Jc: 4, Jmin: 40, Jmax: 70, H1: "10", H2: "20", H3: "30", H4: "40"},
++		ServerPublicKey: "pub",
++		Endpoint:        "1.2.3.4:51820",
++		KeepAlive:       25,
++	})
++	fmt.Println(strings.Contains(conf, "Jc = 4"))
++	// Output: true
++}
+diff --git a/internal/awg/device.go b/internal/awg/device.go
+new file mode 100644
+index 0000000..8cfed73
+--- /dev/null
++++ b/internal/awg/device.go
+@@ -0,0 +1,159 @@
++package awg
++
++import (
++	"bufio"
++	"fmt"
++	"strconv"
++	"strings"
++
++	"github.com/amnezia-vpn/amneziawg-go/conn"
++	"github.com/amnezia-vpn/amneziawg-go/device"
++
++	"github.com/mhsanaei/3x-ui/v3/internal/logger"
++	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
++)
++
++// PeerStat is a per-client traffic and liveness snapshot read from the running
++// device. Up is bytes received from the client, Down is bytes sent to it.
++type PeerStat struct {
++	Email         string
++	Up            int64
++	Down          int64
++	LastHandshake int64
++}
++
++// awgDevice owns one running in-process AmneziaWG server: the gVisor netstack,
++// the amneziawg-go device bound to the inbound's UDP port, and the forwarder
++// that carries decrypted client traffic to the internet.
++type awgDevice struct {
++	dev       *device.Device
++	forwarder *forwarder
++	pubToMail map[string]string
++}
++
++// startDevice stands up the netstack, configures the amneziawg-go device with
++// the server key, obfuscation params and peers, brings it up, and installs the
++// TCP/UDP forwarder.
++func startDevice(inst Instance, dialer Dialer) (*awgDevice, error) {
++	if err := inst.Params.Validate(); err != nil {
++		return nil, err
++	}
++	uapi, err := inst.uapiConfig()
++	if err != nil {
++		return nil, err
++	}
++	tunDev, gstack, err := createNetTUN(inst.localAddrs(), inst.Mtu)
++	if err != nil {
++		return nil, err
++	}
++	logf := func(format string, args ...any) {
++		logger.Debug("awg[", inst.Tag, "]: ", fmt.Sprintf(format, args...))
++	}
++	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), &device.Logger{Verbosef: func(string, ...any) {}, Errorf: logf})
++	if err := dev.IpcSet(uapi); err != nil {
++		dev.Close()
++		return nil, fmt.Errorf("awg: IpcSet: %w", err)
++	}
++	if err := dev.Up(); err != nil {
++		dev.Close()
++		return nil, fmt.Errorf("awg: device up: %w", err)
++	}
++	fwd := newForwarder(gstack, dialer)
++	fwd.install()
++
++	pubToMail := make(map[string]string, len(inst.Peers))
++	for _, peer := range inst.Peers {
++		if hexPub, err := wgutil.KeyToHex(peer.PublicKey); err == nil {
++			pubToMail[hexPub] = peer.Email
++		}
++	}
++	return &awgDevice{dev: dev, forwarder: fwd, pubToMail: pubToMail}, nil
++}
++
++// applyPeers replaces the device's peer set live via IpcSet, so adding or
++// removing a client does not drop the other clients' sessions.
++func (d *awgDevice) applyPeers(inst Instance) error {
++	if d == nil || d.dev == nil {
++		return fmt.Errorf("awg: device not running")
++	}
++	uapi, err := inst.peersUAPIConfig()
++	if err != nil {
++		return err
++	}
++	if err := d.dev.IpcSet(uapi); err != nil {
++		return fmt.Errorf("awg: live peer update: %w", err)
++	}
++	pubToMail := make(map[string]string, len(inst.Peers))
++	for _, peer := range inst.Peers {
++		if hexPub, err := wgutil.KeyToHex(peer.PublicKey); err == nil {
++			pubToMail[hexPub] = peer.Email
++		}
++	}
++	d.pubToMail = pubToMail
++	return nil
++}
++
++func (d *awgDevice) close() {
++	if d == nil {
++		return
++	}
++	if d.forwarder != nil {
++		d.forwarder.close()
++	}
++	if d.dev != nil {
++		d.dev.Close()
++	}
++}
++
++// stats parses the device's IpcGet output into per-client counters. Unknown
++// peers (present on the wire but not in our email map) are skipped.
++func (d *awgDevice) stats() []PeerStat {
++	if d == nil || d.dev == nil {
++		return nil
++	}
++	raw, err := d.dev.IpcGet()
++	if err != nil {
++		return nil
++	}
++	var out []PeerStat
++	var cur *PeerStat
++	flush := func() {
++		if cur != nil && cur.Email != "" {
++			out = append(out, *cur)
++		}
++		cur = nil
++	}
++	scanner := bufio.NewScanner(strings.NewReader(raw))
++	for scanner.Scan() {
++		line := scanner.Text()
++		key, val, ok := strings.Cut(line, "=")
++		if !ok {
++			continue
++		}
++		switch key {
++		case "public_key":
++			flush()
++			email := d.pubToMail[val]
++			cur = &PeerStat{Email: email}
++		case "rx_bytes":
++			if cur != nil {
++				cur.Up = parseInt64(val)
++			}
++		case "tx_bytes":
++			if cur != nil {
++				cur.Down = parseInt64(val)
++			}
++		case "last_handshake_time_sec":
++			if cur != nil {
++				cur.LastHandshake = parseInt64(val)
++			}
++		}
++	}
++	flush()
++	return out
++}
++
++func parseInt64(s string) int64 {
++	v, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
++	return v
++}
+diff --git a/internal/awg/forwarder.go b/internal/awg/forwarder.go
+new file mode 100644
+index 0000000..ee69828
+--- /dev/null
++++ b/internal/awg/forwarder.go
+@@ -0,0 +1,289 @@
++package awg
++
++import (
++	"context"
++	"io"
++	"net"
++	"net/netip"
++	"sync"
++	"time"
++
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
++	"gvisor.dev/gvisor/pkg/tcpip/checksum"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
++	"gvisor.dev/gvisor/pkg/waiter"
++
++	"github.com/mhsanaei/3x-ui/v3/internal/logger"
++	"github.com/mhsanaei/3x-ui/v3/internal/util/netsafe"
++)
++
++// Dialer opens connections to the real destination a tunnelled client asked
++// for. Production uses a plain net.Dialer so traffic egresses through the host;
++// tests inject a fake to observe forwarding without real network access.
++type Dialer interface {
++	DialContext(ctx context.Context, network, address string) (net.Conn, error)
++}
++
++const (
++	udpSessionTimeout = 60 * time.Second
++	udpBufferSize     = 65535
++	dialTimeout       = 12 * time.Second
++)
++
++// forwarder splices decrypted client flows to their destinations. It is
++// installed on the gVisor stack after the AmneziaWG device is up.
++type forwarder struct {
++	stack  *stack.Stack
++	dialer Dialer
++
++	mu       sync.Mutex
++	sessions map[string]*udpSession
++	closed   bool
++}
++
++func newForwarder(gstack *stack.Stack, dialer Dialer) *forwarder {
++	if dialer == nil {
++		dialer = &net.Dialer{Timeout: dialTimeout}
++	}
++	return &forwarder{
++		stack:    gstack,
++		dialer:   dialer,
++		sessions: make(map[string]*udpSession),
++	}
++}
++
++// install enables promiscuous+spoofing on the NIC (so the stack accepts and
++// answers for destinations that are not its own address) and wires the TCP and
++// UDP transport handlers that hand flows to the forwarder.
++func (f *forwarder) install() {
++	f.stack.SetPromiscuousMode(nicID, true)
++	f.stack.SetSpoofing(nicID, true)
++
++	tcpForwarder := tcp.NewForwarder(f.stack, 0, 65535, func(r *tcp.ForwarderRequest) {
++		id := r.ID()
++		var wq waiter.Queue
++		ep, tcpErr := r.CreateEndpoint(&wq)
++		if tcpErr != nil {
++			r.Complete(true)
++			return
++		}
++		r.Complete(false)
++		ep.SocketOptions().SetKeepAlive(true)
++		local := gonet.NewTCPConn(&wq, ep)
++		go f.handleTCP(local, addrPortOf(id.LocalAddress, id.LocalPort))
++	})
++	f.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
++
++	f.stack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
++		payload := pkt.Data().AsRange().ToSlice()
++		src := addrPortOf(id.RemoteAddress, id.RemotePort)
++		dst := addrPortOf(id.LocalAddress, id.LocalPort)
++		if !src.IsValid() || !dst.IsValid() {
++			return true
++		}
++		f.handleUDP(src, dst, payload)
++		return true
++	})
++}
++
++func (f *forwarder) handleTCP(local net.Conn, dst netip.AddrPort) {
++	defer local.Close()
++	if blockedDestination(dst) {
++		logger.Debug("awg: blocked tcp to internal address ", dst.String())
++		return
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
++	remote, err := f.dialer.DialContext(ctx, "tcp", dst.String())
++	cancel()
++	if err != nil {
++		logger.Debug("awg: tcp dial ", dst.String(), " failed: ", err)
++		return
++	}
++	defer remote.Close()
++	relay(local, remote)
++}
++
++// relay copies bytes in both directions until either side closes, then unblocks
++// the peer so both goroutines exit.
++func relay(a, b net.Conn) {
++	done := make(chan struct{}, 2)
++	go func() {
++		_, _ = io.Copy(a, b)
++		done <- struct{}{}
++	}()
++	go func() {
++		_, _ = io.Copy(b, a)
++		done <- struct{}{}
++	}()
++	<-done
++	_ = a.SetDeadline(time.Now())
++	_ = b.SetDeadline(time.Now())
++	<-done
++}
++
++// udpSession is one userspace-NAT flow: a host UDP socket to a single
++// destination whose replies are written back into the tunnel as if they came
++// from that destination.
++type udpSession struct {
++	conn     net.Conn
++	src      netip.AddrPort
++	dst      netip.AddrPort
++	lastSeen time.Time
++}
++
++func (f *forwarder) handleUDP(src, dst netip.AddrPort, payload []byte) {
++	if blockedDestination(dst) {
++		return
++	}
++	key := src.String() + "|" + dst.String()
++
++	f.mu.Lock()
++	if f.closed {
++		f.mu.Unlock()
++		return
++	}
++	sess, ok := f.sessions[key]
++	if !ok {
++		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
++		conn, err := f.dialer.DialContext(ctx, "udp", dst.String())
++		cancel()
++		if err != nil {
++			f.mu.Unlock()
++			logger.Debug("awg: udp dial ", dst.String(), " failed: ", err)
++			return
++		}
++		sess = &udpSession{conn: conn, src: src, dst: dst, lastSeen: time.Now()}
++		f.sessions[key] = sess
++		go f.udpReadLoop(key, sess)
++	}
++	sess.lastSeen = time.Now()
++	conn := sess.conn
++	f.mu.Unlock()
++
++	_, _ = conn.Write(payload)
++}
++
++func (f *forwarder) udpReadLoop(key string, sess *udpSession) {
++	buf := make([]byte, udpBufferSize)
++	defer f.closeUDP(key, sess)
++	for {
++		_ = sess.conn.SetReadDeadline(time.Now().Add(udpSessionTimeout))
++		n, err := sess.conn.Read(buf)
++		if n > 0 {
++			if writeErr := f.writeRawUDP(sess.dst, sess.src, buf[:n]); writeErr != nil {
++				logger.Debug("awg: udp write-back failed: ", writeErr)
++				return
++			}
++			f.mu.Lock()
++			sess.lastSeen = time.Now()
++			f.mu.Unlock()
++		}
++		if err != nil {
++			return
++		}
++	}
++}
++
++func (f *forwarder) closeUDP(key string, sess *udpSession) {
++	f.mu.Lock()
++	if cur, ok := f.sessions[key]; ok && cur == sess {
++		delete(f.sessions, key)
++	}
++	f.mu.Unlock()
++	_ = sess.conn.Close()
++}
++
++func (f *forwarder) close() {
++	f.mu.Lock()
++	f.closed = true
++	sessions := f.sessions
++	f.sessions = make(map[string]*udpSession)
++	f.mu.Unlock()
++	for _, sess := range sessions {
++		_ = sess.conn.Close()
++	}
++}
++
++// writeRawUDP crafts a UDP/IP packet (src=the real destination, dst=the client)
++// and injects it into the stack so the AmneziaWG device encrypts it back to the
++// client. Mirrors xray-core's WireGuard reply path.
++func (f *forwarder) writeRawUDP(src, dst netip.AddrPort, payload []byte) error {
++	udpLen := header.UDPMinimumSize + len(payload)
++	srcIP := tcpip.AddrFromSlice(src.Addr().AsSlice())
++	dstIP := tcpip.AddrFromSlice(dst.Addr().AsSlice())
++
++	isIPv4 := dst.Addr().Is4()
++	ipHdrSize := header.IPv6MinimumSize
++	ipProtocol := header.IPv6ProtocolNumber
++	if isIPv4 {
++		ipHdrSize = header.IPv4MinimumSize
++		ipProtocol = header.IPv4ProtocolNumber
++	}
++
++	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
++		ReserveHeaderBytes: ipHdrSize + header.UDPMinimumSize,
++		Payload:            buffer.MakeWithData(payload),
++	})
++	defer pkt.DecRef()
++
++	udpHdr := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))
++	udpHdr.Encode(&header.UDPFields{
++		SrcPort: src.Port(),
++		DstPort: dst.Port(),
++		Length:  uint16(udpLen),
++	})
++	xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, srcIP, dstIP, uint16(udpLen))
++	udpHdr.SetChecksum(^udpHdr.CalculateChecksum(checksum.Checksum(payload, xsum)))
++
++	if isIPv4 {
++		ipHdr := header.IPv4(pkt.NetworkHeader().Push(header.IPv4MinimumSize))
++		ipHdr.Encode(&header.IPv4Fields{
++			TotalLength: uint16(header.IPv4MinimumSize + udpLen),
++			TTL:         64,
++			Protocol:    uint8(header.UDPProtocolNumber),
++			SrcAddr:     srcIP,
++			DstAddr:     dstIP,
++		})
++		ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
++	} else {
++		ipHdr := header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize))
++		ipHdr.Encode(&header.IPv6Fields{
++			PayloadLength:     uint16(udpLen),
++			TransportProtocol: header.UDPProtocolNumber,
++			HopLimit:          64,
++			SrcAddr:           srcIP,
++			DstAddr:           dstIP,
++		})
++	}
++
++	if tcpErr := f.stack.WriteRawPacket(nicID, ipProtocol, buffer.MakeWithView(pkt.ToView())); tcpErr != nil {
++		return &tcpipError{tcpErr}
++	}
++	return nil
++}
++
++// blockedDestination fences client egress: loopback, private, link-local and
++// unspecified targets are refused so a tunnelled client cannot reach the panel
++// host's own services (panel API, Xray gRPC, the devices themselves) or the
++// server's LAN. This is the userspace-forwarder equivalent of the host firewall
++// rules that would fence a kernel WireGuard interface.
++func blockedDestination(dst netip.AddrPort) bool {
++	return netsafe.IsBlockedIP(net.IP(dst.Addr().AsSlice()))
++}
++
++func addrPortOf(addr tcpip.Address, port uint16) netip.AddrPort {
++	ip, ok := netip.AddrFromSlice(addr.AsSlice())
++	if !ok {
++		return netip.AddrPort{}
++	}
++	return netip.AddrPortFrom(ip.Unmap(), port)
++}
++
++type tcpipError struct{ err tcpip.Error }
++
++func (e *tcpipError) Error() string { return e.err.String() }
+diff --git a/internal/awg/forwarder_test.go b/internal/awg/forwarder_test.go
+new file mode 100644
+index 0000000..10baac8
+--- /dev/null
++++ b/internal/awg/forwarder_test.go
+@@ -0,0 +1,37 @@
++package awg
++
++import (
++	"net/netip"
++	"testing"
++)
++
++func TestBlockedDestination(t *testing.T) {
++	blocked := []string{
++		"127.0.0.1:80",
++		"10.0.0.5:443",
++		"192.168.1.1:53",
++		"172.16.0.1:443",
++		"169.254.1.1:80",
++		"0.0.0.0:80",
++		"[::1]:443",
++		"[fe80::1]:443",
++	}
++	for _, s := range blocked {
++		ap := netip.MustParseAddrPort(s)
++		if !blockedDestination(ap) {
++			t.Errorf("expected %s to be blocked (internal address)", s)
++		}
++	}
++	allowed := []string{
++		"1.1.1.1:53",
++		"8.8.8.8:443",
++		"93.184.216.34:80",
++		"[2606:4700:4700::1111]:443",
++	}
++	for _, s := range allowed {
++		ap := netip.MustParseAddrPort(s)
++		if blockedDestination(ap) {
++			t.Errorf("expected %s to be allowed (public address)", s)
++		}
++	}
++}
+diff --git a/internal/awg/manager.go b/internal/awg/manager.go
+new file mode 100644
+index 0000000..afb61b2
+--- /dev/null
++++ b/internal/awg/manager.go
+@@ -0,0 +1,182 @@
++package awg
++
++import (
++	"sync"
++
++	"github.com/mhsanaei/3x-ui/v3/internal/logger"
++)
++
++// Traffic is a per-client traffic delta collected from a running device between
++// two polls, tagged with the owning inbound.
++type Traffic struct {
++	Tag   string
++	Email string
++	Up    int64
++	Down  int64
++}
++
++// managed is the actual running state of one AmneziaWG inbound.
++type managed struct {
++	dev         *awgDevice
++	tag         string
++	devicePrint string
++	peersPrint  string
++	lastUp      map[string]int64
++	lastDown    map[string]int64
++}
++
++// Manager supervises the in-process AmneziaWG devices, one per inbound id. It
++// is the AmneziaWG analogue of the mtproto sidecar manager: desired state comes
++// from the DB, actual state lives here, and a fingerprint decides when a device
++// must be rebuilt versus updated live.
++type Manager struct {
++	mu     sync.Mutex
++	devs   map[int]*managed
++	dialer Dialer
++}
++
++var (
++	manager     *Manager
++	managerOnce sync.Once
++)
++
++// GetManager returns the process-wide AmneziaWG manager singleton.
++func GetManager() *Manager {
++	managerOnce.Do(func() {
++		manager = &Manager{devs: make(map[int]*managed)}
++	})
++	return manager
++}
++
++// SetDialer overrides the egress dialer used by every device started
++// afterwards. Intended for tests; production uses the default host dialer.
++func (m *Manager) SetDialer(d Dialer) {
++	m.mu.Lock()
++	m.dialer = d
++	m.mu.Unlock()
++}
++
++// Ensure brings a single inbound's device to the desired state, starting,
++// restarting, or live-updating it as needed.
++func (m *Manager) Ensure(inst Instance) error {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return m.ensureLocked(inst)
++}
++
++func (m *Manager) ensureLocked(inst Instance) error {
++	devPrint := inst.deviceFingerprint()
++	peersPrint := inst.peersFingerprint()
++
++	if cur, ok := m.devs[inst.Id]; ok {
++		if cur.devicePrint == devPrint {
++			cur.tag = inst.Tag
++			if cur.peersPrint == peersPrint {
++				return nil
++			}
++			if err := cur.dev.applyPeers(inst); err != nil {
++				return err
++			}
++			cur.peersPrint = peersPrint
++			return nil
++		}
++		cur.dev.close()
++		delete(m.devs, inst.Id)
++	}
++
++	dev, err := startDevice(inst, m.dialer)
++	if err != nil {
++		return err
++	}
++	m.devs[inst.Id] = &managed{
++		dev:         dev,
++		tag:         inst.Tag,
++		devicePrint: devPrint,
++		peersPrint:  peersPrint,
++		lastUp:      make(map[string]int64),
++		lastDown:    make(map[string]int64),
++	}
++	logger.Info("awg: started inbound ", inst.Tag, " on port ", inst.ListenPort, " with ", len(inst.Peers), " peer(s)")
++	return nil
++}
++
++// Remove stops and forgets the device for an inbound id.
++func (m *Manager) Remove(id int) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if cur, ok := m.devs[id]; ok {
++		cur.dev.close()
++		delete(m.devs, id)
++		logger.Info("awg: stopped inbound ", cur.tag)
++	}
++}
++
++// Reconcile drives the running devices to exactly match the desired set: it
++// stops devices whose inbound is gone or disabled and ensures the rest.
++func (m *Manager) Reconcile(desired []Instance) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	want := make(map[int]struct{}, len(desired))
++	for _, inst := range desired {
++		want[inst.Id] = struct{}{}
++	}
++	for id, cur := range m.devs {
++		if _, ok := want[id]; !ok {
++			cur.dev.close()
++			delete(m.devs, id)
++			logger.Info("awg: stopped inbound ", cur.tag)
++		}
++	}
++	for _, inst := range desired {
++		if err := m.ensureLocked(inst); err != nil {
++			logger.Warning("awg: ensure inbound ", inst.Tag, " failed: ", err)
++		}
++	}
++}
++
++// StopAll tears down every running device (panel shutdown).
++func (m *Manager) StopAll() {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	for id, cur := range m.devs {
++		cur.dev.close()
++		delete(m.devs, id)
++	}
++}
++
++// CollectTraffic snapshots every device's per-peer counters and returns the
++// positive deltas since the previous call, so the reconcile job can fold them
++// into inbound and client traffic totals.
++func (m *Manager) CollectTraffic() []Traffic {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	var out []Traffic
++	for _, cur := range m.devs {
++		for _, st := range cur.dev.stats() {
++			if st.Email == "" {
++				continue
++			}
++			up := delta(cur.lastUp, st.Email, st.Up)
++			down := delta(cur.lastDown, st.Email, st.Down)
++			if up == 0 && down == 0 {
++				continue
++			}
++			out = append(out, Traffic{Tag: cur.tag, Email: st.Email, Up: up, Down: down})
++		}
++	}
++	return out
++}
++
++// delta returns the non-negative increase of a cumulative counter versus its
++// stored baseline, then updates the baseline. A drop (device restart resets the
++// counter to a lower value) yields 0 rather than a negative delta.
++func delta(baseline map[string]int64, email string, current int64) int64 {
++	prev, ok := baseline[email]
++	baseline[email] = current
++	if !ok || current < prev {
++		return 0
++	}
++	return current - prev
++}
+diff --git a/internal/awg/manager_test.go b/internal/awg/manager_test.go
+new file mode 100644
+index 0000000..6b27dc2
+--- /dev/null
++++ b/internal/awg/manager_test.go
+@@ -0,0 +1,124 @@
++package awg
++
++import (
++	"context"
++	"errors"
++	"net"
++	"testing"
++
++	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
++)
++
++type errDialer struct{}
++
++func (errDialer) DialContext(context.Context, string, string) (net.Conn, error) {
++	return nil, errors.New("awg test: no egress")
++}
++
++func freeUDPPort(t *testing.T) int {
++	t.Helper()
++	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatalf("free port: %v", err)
++	}
++	port := c.LocalAddr().(*net.UDPAddr).Port
++	_ = c.Close()
++	return port
++}
++
++func testInstance(t *testing.T, id, port int) Instance {
++	t.Helper()
++	serverPriv, _, err := wgutil.GenerateWireguardKeypair()
++	if err != nil {
++		t.Fatalf("server key: %v", err)
++	}
++	_, peerPub, err := wgutil.GenerateWireguardKeypair()
++	if err != nil {
++		t.Fatalf("peer key: %v", err)
++	}
++	inst := Instance{
++		Id:         id,
++		Tag:        "awg-test",
++		ListenPort: port,
++		SecretKey:  serverPriv,
++		Mtu:        1420,
++		Params:     GenerateParams(),
++	}
++	inst.Addresses = parseServerAddresses(nil, nil)
++	inst.Peers = []Peer{{
++		Email:      "tester",
++		PublicKey:  peerPub,
++		AllowedIPs: []string{"10.0.0.2/32"},
++		KeepAlive:  25,
++	}}
++	return inst
++}
++
++// TestManagerLifecycle stands up a real in-process AmneziaWG device (gVisor
++// netstack + amneziawg-go device + forwarder) with obfuscation params, then
++// updates peers live and tears it down. It proves the whole userspace data
++// plane assembles and runs without root; it does not exercise a real client
++// handshake (no AmneziaWG client is available in the test environment).
++func TestManagerLifecycle(t *testing.T) {
++	m := &Manager{devs: make(map[int]*managed)}
++	m.SetDialer(errDialer{})
++
++	inst := testInstance(t, 1, freeUDPPort(t))
++	if err := m.Ensure(inst); err != nil {
++		t.Fatalf("Ensure start: %v", err)
++	}
++	if len(m.devs) != 1 {
++		t.Fatalf("expected 1 running device, got %d", len(m.devs))
++	}
++
++	if got := m.CollectTraffic(); len(got) != 0 {
++		t.Fatalf("expected no traffic without a client, got %d entries", len(got))
++	}
++
++	devicePrint := m.devs[1].devicePrint
++	peersPrint := m.devs[1].peersPrint
++	_, peer2Pub, _ := wgutil.GenerateWireguardKeypair()
++	inst.Peers = append(inst.Peers, Peer{Email: "second", PublicKey: peer2Pub, AllowedIPs: []string{"10.0.0.3/32"}})
++	if err := m.Ensure(inst); err != nil {
++		t.Fatalf("Ensure live peer update: %v", err)
++	}
++	if m.devs[1].devicePrint != devicePrint {
++		t.Fatal("adding a peer must not restart the device")
++	}
++	if m.devs[1].peersPrint == peersPrint {
++		t.Fatal("peers fingerprint should have changed")
++	}
++
++	m.Reconcile(nil)
++	if len(m.devs) != 0 {
++		t.Fatalf("Reconcile(nil) should stop all devices, got %d", len(m.devs))
++	}
++
++	if err := m.Ensure(testInstance(t, 2, freeUDPPort(t))); err != nil {
++		t.Fatalf("Ensure after reconcile: %v", err)
++	}
++	m.StopAll()
++	if len(m.devs) != 0 {
++		t.Fatalf("StopAll should clear devices, got %d", len(m.devs))
++	}
++}
++
++func TestManagerReconcileStopsRemoved(t *testing.T) {
++	m := &Manager{devs: make(map[int]*managed)}
++	m.SetDialer(errDialer{})
++
++	a := testInstance(t, 10, freeUDPPort(t))
++	b := testInstance(t, 11, freeUDPPort(t))
++	m.Reconcile([]Instance{a, b})
++	if len(m.devs) != 2 {
++		t.Fatalf("expected 2 devices, got %d", len(m.devs))
++	}
++	m.Reconcile([]Instance{a})
++	if len(m.devs) != 1 {
++		t.Fatalf("expected 1 device after dropping b, got %d", len(m.devs))
++	}
++	if _, ok := m.devs[10]; !ok {
++		t.Fatal("device 10 should still be running")
++	}
++	m.StopAll()
++}
+diff --git a/internal/awg/netstack.go b/internal/awg/netstack.go
+new file mode 100644
+index 0000000..345f246
+--- /dev/null
++++ b/internal/awg/netstack.go
+@@ -0,0 +1,159 @@
++package awg
++
++import (
++	"fmt"
++	"net/netip"
++	"os"
++	"syscall"
++
++	awgtun "github.com/amnezia-vpn/amneziawg-go/tun"
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
++	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
++	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
++)
++
++const nicID tcpip.NICID = 1
++
++// netTun is a userspace TUN device backed by a gVisor network stack. The
++// AmneziaWG device writes decrypted client IP packets into it (Write ->
++// InjectInbound) and reads encapsulation-bound packets out of it (WriteNotify
++// -> Read). It mirrors xray-core's WireGuard netstack so the whole datapath
++// runs in-process with no kernel TUN and no root.
++type netTun struct {
++	ep             *channel.Endpoint
++	stack          *stack.Stack
++	events         chan awgtun.Event
++	notifyHandle   *channel.NotificationHandle
++	incomingPacket chan *buffer.View
++	mtu            int
++}
++
++// createNetTUN builds the gVisor stack, assigns the server's tunnel addresses
++// to the single NIC, and installs a default route for each enabled family so
++// every decrypted destination reaches the transport forwarders.
++func createNetTUN(localAddresses []netip.Addr, mtu int) (awgtun.Device, *stack.Stack, error) {
++	opts := stack.Options{
++		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
++		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
++		HandleLocal:        false,
++	}
++	dev := &netTun{
++		ep:             channel.New(1024, uint32(mtu), ""),
++		stack:          stack.New(opts),
++		events:         make(chan awgtun.Event, 10),
++		incomingPacket: make(chan *buffer.View),
++		mtu:            mtu,
++	}
++	sackEnabledOpt := tcpip.TCPSACKEnabled(true)
++	if tcpipErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt); tcpipErr != nil {
++		return nil, nil, fmt.Errorf("awg: could not enable TCP SACK: %v", tcpipErr)
++	}
++	dev.notifyHandle = dev.ep.AddNotify(dev)
++	if tcpipErr := dev.stack.CreateNIC(nicID, dev.ep); tcpipErr != nil {
++		return nil, nil, fmt.Errorf("awg: CreateNIC: %v", tcpipErr)
++	}
++	var hasV4, hasV6 bool
++	for _, ip := range localAddresses {
++		var protoNumber tcpip.NetworkProtocolNumber
++		if ip.Is4() {
++			protoNumber = ipv4.ProtocolNumber
++		} else if ip.Is6() {
++			protoNumber = ipv6.ProtocolNumber
++		}
++		protoAddr := tcpip.ProtocolAddress{
++			Protocol:          protoNumber,
++			AddressWithPrefix: tcpip.AddrFromSlice(ip.AsSlice()).WithPrefix(),
++		}
++		if tcpipErr := dev.stack.AddProtocolAddress(nicID, protoAddr, stack.AddressProperties{}); tcpipErr != nil {
++			return nil, nil, fmt.Errorf("awg: AddProtocolAddress(%v): %v", ip, tcpipErr)
++		}
++		if ip.Is4() {
++			hasV4 = true
++		} else if ip.Is6() {
++			hasV6 = true
++		}
++	}
++	if hasV4 {
++		dev.stack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: nicID})
++	}
++	if hasV6 {
++		dev.stack.AddRoute(tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: nicID})
++	}
++	dev.events <- awgtun.EventUp
++	return dev, dev.stack, nil
++}
++
++func (tun *netTun) Name() (string, error) { return "awg", nil }
++
++func (tun *netTun) File() *os.File { return nil }
++
++func (tun *netTun) Events() <-chan awgtun.Event { return tun.events }
++
++func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
++	view, ok := <-tun.incomingPacket
++	if !ok {
++		return 0, os.ErrClosed
++	}
++	n, err := view.Read(buf[0][offset:])
++	if err != nil {
++		return 0, err
++	}
++	sizes[0] = n
++	return 1, nil
++}
++
++func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
++	for _, buf := range buf {
++		packet := buf[offset:]
++		if len(packet) == 0 {
++			continue
++		}
++		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(packet)})
++		switch packet[0] >> 4 {
++		case 4:
++			tun.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
++		case 6:
++			tun.ep.InjectInbound(header.IPv6ProtocolNumber, pkb)
++		default:
++			pkb.DecRef()
++			return 0, syscall.EAFNOSUPPORT
++		}
++		pkb.DecRef()
++	}
++	return len(buf), nil
++}
++
++func (tun *netTun) WriteNotify() {
++	pkt := tun.ep.Read()
++	if pkt == nil {
++		return
++	}
++	view := pkt.ToView()
++	pkt.DecRef()
++	tun.incomingPacket <- view
++}
++
++func (tun *netTun) Close() error {
++	tun.stack.RemoveNIC(nicID)
++	tun.stack.Close()
++	tun.ep.RemoveNotify(tun.notifyHandle)
++	tun.ep.Close()
++	if tun.events != nil {
++		close(tun.events)
++	}
++	if tun.incomingPacket != nil {
++		close(tun.incomingPacket)
++	}
++	return nil
++}
++
++func (tun *netTun) MTU() (int, error) { return tun.mtu, nil }
++
++func (tun *netTun) BatchSize() int { return 1 }
+diff --git a/internal/awg/params.go b/internal/awg/params.go
+new file mode 100644
+index 0000000..53700ff
+--- /dev/null
++++ b/internal/awg/params.go
+@@ -0,0 +1,259 @@
++package awg
++
++import (
++	"crypto/rand"
++	"encoding/binary"
++	"fmt"
++	"strconv"
++	"strings"
++)
++
++// Params holds the AmneziaWG obfuscation knobs that make the tunnel diverge
++// from a fingerprintable WireGuard flow. They must match between client and
++// server (except the junk-packet counts, which are one-way) or the handshake's
++// magic-header/length checks fail. Field names follow the AmneziaWG 2.0 scheme
++// implemented by amneziawg-go: Jc/Jmin/Jmax (junk packets), S1..S4 (message
++// paddings), H1..H4 (magic headers), I1..I5 (custom protocol-signature junk).
++type Params struct {
++	Jc   int    `json:"jc"`
++	Jmin int    `json:"jmin"`
++	Jmax int    `json:"jmax"`
++	S1   int    `json:"s1"`
++	S2   int    `json:"s2"`
++	S3   int    `json:"s3"`
++	S4   int    `json:"s4"`
++	H1   string `json:"h1"`
++	H2   string `json:"h2"`
++	H3   string `json:"h3"`
++	H4   string `json:"h4"`
++	I1   string `json:"i1"`
++	I2   string `json:"i2"`
++	I3   string `json:"i3"`
++	I4   string `json:"i4"`
++	I5   string `json:"i5"`
++}
++
++func (p Params) headers() []string { return []string{p.H1, p.H2, p.H3, p.H4} }
++
++func (p Params) iPackets() []string { return []string{p.I1, p.I2, p.I3, p.I4, p.I5} }
++
++// IsWireGuardCompatible reports whether the params carry no obfuscation, so the
++// device behaves as vanilla WireGuard and can interoperate with a stock peer.
++func (p Params) IsWireGuardCompatible() bool {
++	if p.Jc != 0 || p.Jmin != 0 || p.Jmax != 0 || p.S1 != 0 || p.S2 != 0 || p.S3 != 0 || p.S4 != 0 {
++		return false
++	}
++	for _, h := range p.headers() {
++		if strings.TrimSpace(h) != "" {
++			return false
++		}
++	}
++	for _, i := range p.iPackets() {
++		if strings.TrimSpace(i) != "" {
++			return false
++		}
++	}
++	return true
++}
++
++// Validate rejects parameter combinations amneziawg-go would reject at IpcSet
++// time, so the panel can surface a clear error before starting the device.
++func (p Params) Validate() error {
++	junkSet := p.Jc != 0 || p.Jmin != 0 || p.Jmax != 0
++	if junkSet {
++		if p.Jc <= 0 || p.Jmin <= 0 || p.Jmax <= 0 {
++			return fmt.Errorf("awg: Jc, Jmin and Jmax must all be positive when junk packets are enabled")
++		}
++		if p.Jmin > p.Jmax {
++			return fmt.Errorf("awg: Jmin (%d) must not exceed Jmax (%d)", p.Jmin, p.Jmax)
++		}
++	}
++	for name, s := range map[string]int{"S1": p.S1, "S2": p.S2, "S3": p.S3, "S4": p.S4} {
++		if s < 0 {
++			return fmt.Errorf("awg: %s must not be negative", name)
++		}
++	}
++
++	set := 0
++	values := make([]uint64, 0, 4)
++	singles := true
++	for idx, h := range p.headers() {
++		h = strings.TrimSpace(h)
++		if h == "" {
++			continue
++		}
++		set++
++		lo, hi, err := parseMagicHeader(h)
++		if err != nil {
++			return fmt.Errorf("awg: H%d: %w", idx+1, err)
++		}
++		if lo != hi {
++			singles = false
++		}
++		values = append(values, lo)
++	}
++	if set != 0 && set != 4 {
++		return fmt.Errorf("awg: set either all four magic headers (H1-H4) or none")
++	}
++	if set == 4 && singles {
++		for i := 0; i < len(values); i++ {
++			for j := i + 1; j < len(values); j++ {
++				if values[i] == values[j] {
++					return fmt.Errorf("awg: magic headers H1-H4 must be distinct")
++				}
++			}
++		}
++	}
++	return nil
++}
++
++// parseMagicHeader parses a single uint32 ("1148618200") or an inclusive range
++// ("100-200"), matching amneziawg-go's newMagicHeader.
++func parseMagicHeader(s string) (lo, hi uint64, err error) {
++	s = strings.TrimSpace(s)
++	if idx := strings.IndexByte(s, '-'); idx >= 0 {
++		lo, err = strconv.ParseUint(strings.TrimSpace(s[:idx]), 10, 32)
++		if err != nil {
++			return 0, 0, fmt.Errorf("invalid magic header range start %q", s[:idx])
++		}
++		hi, err = strconv.ParseUint(strings.TrimSpace(s[idx+1:]), 10, 32)
++		if err != nil {
++			return 0, 0, fmt.Errorf("invalid magic header range end %q", s[idx+1:])
++		}
++		if hi < lo {
++			return 0, 0, fmt.Errorf("magic header range end %d below start %d", hi, lo)
++		}
++		return lo, hi, nil
++	}
++	lo, err = strconv.ParseUint(s, 10, 32)
++	if err != nil {
++		return 0, 0, fmt.Errorf("invalid magic header %q", s)
++	}
++	return lo, lo, nil
++}
++
++// appendUAPILines writes the AmneziaWG device-level lines (lowercase keys) that
++// configure the amneziawg-go device via IpcSet. Only non-default values are
++// emitted; unset magic headers leave the device at WireGuard's 1/2/3/4.
++func (p Params) appendUAPILines(sb *strings.Builder) {
++	if p.Jc > 0 {
++		fmt.Fprintf(sb, "jc=%d\n", p.Jc)
++		fmt.Fprintf(sb, "jmin=%d\n", p.Jmin)
++		fmt.Fprintf(sb, "jmax=%d\n", p.Jmax)
++	}
++	writeInt(sb, "s1", p.S1)
++	writeInt(sb, "s2", p.S2)
++	writeInt(sb, "s3", p.S3)
++	writeInt(sb, "s4", p.S4)
++	for idx, h := range p.headers() {
++		if h = strings.TrimSpace(h); h != "" {
++			fmt.Fprintf(sb, "h%d=%s\n", idx+1, h)
++		}
++	}
++	for idx, i := range p.iPackets() {
++		if i = strings.TrimSpace(i); i != "" {
++			fmt.Fprintf(sb, "i%d=%s\n", idx+1, i)
++		}
++	}
++}
++
++// appendConfLines writes the AmneziaWG [Interface] keys (CamelCase) for a client
++// .conf; these must match the server for the handshake to complete.
++func (p Params) appendConfLines(sb *strings.Builder) {
++	if p.Jc > 0 {
++		fmt.Fprintf(sb, "Jc = %d\n", p.Jc)
++		fmt.Fprintf(sb, "Jmin = %d\n", p.Jmin)
++		fmt.Fprintf(sb, "Jmax = %d\n", p.Jmax)
++	}
++	writeConfInt(sb, "S1", p.S1)
++	writeConfInt(sb, "S2", p.S2)
++	writeConfInt(sb, "S3", p.S3)
++	writeConfInt(sb, "S4", p.S4)
++	names := []string{"H1", "H2", "H3", "H4"}
++	for idx, h := range p.headers() {
++		if h = strings.TrimSpace(h); h != "" {
++			fmt.Fprintf(sb, "%s = %s\n", names[idx], h)
++		}
++	}
++	iNames := []string{"I1", "I2", "I3", "I4", "I5"}
++	for idx, i := range p.iPackets() {
++		if i = strings.TrimSpace(i); i != "" {
++			fmt.Fprintf(sb, "%s = %s\n", iNames[idx], i)
++		}
++	}
++}
++
++func writeInt(sb *strings.Builder, key string, v int) {
++	if v > 0 {
++		fmt.Fprintf(sb, "%s=%d\n", key, v)
++	}
++}
++
++func writeConfInt(sb *strings.Builder, key string, v int) {
++	if v > 0 {
++		fmt.Fprintf(sb, "%s = %d\n", key, v)
++	}
++}
++
++// fingerprint is a stable string of every param value; the manager restarts a
++// device only when this changes.
++func (p Params) fingerprint() string {
++	return strings.Join([]string{
++		strconv.Itoa(p.Jc), strconv.Itoa(p.Jmin), strconv.Itoa(p.Jmax),
++		strconv.Itoa(p.S1), strconv.Itoa(p.S2), strconv.Itoa(p.S3), strconv.Itoa(p.S4),
++		p.H1, p.H2, p.H3, p.H4, p.I1, p.I2, p.I3, p.I4, p.I5,
++	}, "|")
++}
++
++// GenerateParams returns a randomized obfuscating parameter set suitable as the
++// default for a new AmneziaWG inbound: a handful of junk packets, small init and
++// response paddings, and four distinct magic headers well above WireGuard's
++// reserved 1-4 message types.
++func GenerateParams() Params {
++	jmin := 40 + randInt(50)
++	p := Params{
++		Jc:   3 + randInt(8),
++		Jmin: jmin,
++		Jmax: jmin + 20 + randInt(80),
++		S1:   15 + randInt(80),
++		S2:   15 + randInt(80),
++	}
++	headers := randomHeaders()
++	p.H1, p.H2, p.H3, p.H4 = headers[0], headers[1], headers[2], headers[3]
++	return p
++}
++
++// randomHeaders returns four distinct uint32 magic headers, each above 4 so they
++// never collide with WireGuard's reserved message-type bytes.
++func randomHeaders() [4]string {
++	var out [4]string
++	seen := make(map[uint32]struct{}, 4)
++	for i := 0; i < 4; {
++		v := randUint32()
++		if v <= 4 {
++			continue
++		}
++		if _, dup := seen[v]; dup {
++			continue
++		}
++		seen[v] = struct{}{}
++		out[i] = strconv.FormatUint(uint64(v), 10)
++		i++
++	}
++	return out
++}
++
++func randInt(n int) int {
++	if n <= 0 {
++		return 0
++	}
++	return int(randUint32() % uint32(n))
++}
++
++func randUint32() uint32 {
++	var b [4]byte
++	if _, err := rand.Read(b[:]); err != nil {
++		return 0
++	}
++	return binary.BigEndian.Uint32(b[:])
++}
+diff --git a/internal/awg/params_test.go b/internal/awg/params_test.go
+new file mode 100644
+index 0000000..e4c13cf
+--- /dev/null
++++ b/internal/awg/params_test.go
+@@ -0,0 +1,154 @@
++package awg
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestParamsValidate(t *testing.T) {
++	tests := []struct {
++		name    string
++		params  Params
++		wantErr string
++	}{
++		{
++			name:   "empty is wireguard compatible",
++			params: Params{},
++		},
++		{
++			name:   "full obfuscation valid",
++			params: Params{Jc: 4, Jmin: 40, Jmax: 70, S1: 30, S2: 40, H1: "10", H2: "20", H3: "30", H4: "40"},
++		},
++		{
++			name:    "junk half set",
++			params:  Params{Jc: 4, Jmin: 0, Jmax: 70},
++			wantErr: "must all be positive",
++		},
++		{
++			name:    "jmin above jmax",
++			params:  Params{Jc: 4, Jmin: 80, Jmax: 70},
++			wantErr: "must not exceed",
++		},
++		{
++			name:    "negative padding",
++			params:  Params{S1: -1},
++			wantErr: "must not be negative",
++		},
++		{
++			name:    "three headers set",
++			params:  Params{H1: "10", H2: "20", H3: "30"},
++			wantErr: "all four magic headers",
++		},
++		{
++			name:    "duplicate headers",
++			params:  Params{H1: "10", H2: "10", H3: "30", H4: "40"},
++			wantErr: "must be distinct",
++		},
++		{
++			name:   "header ranges valid",
++			params: Params{H1: "100-200", H2: "300-400", H3: "500-600", H4: "700-800"},
++		},
++		{
++			name:    "bad header value",
++			params:  Params{H1: "abc", H2: "20", H3: "30", H4: "40"},
++			wantErr: "invalid magic header",
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			err := tt.params.Validate()
++			if tt.wantErr == "" {
++				if err != nil {
++					t.Fatalf("Validate() = %v, want nil", err)
++				}
++				return
++			}
++			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
++				t.Fatalf("Validate() = %v, want error containing %q", err, tt.wantErr)
++			}
++		})
++	}
++}
++
++func TestIsWireGuardCompatible(t *testing.T) {
++	if !(Params{}).IsWireGuardCompatible() {
++		t.Fatal("empty params should be wireguard compatible")
++	}
++	if (Params{Jc: 1, Jmin: 1, Jmax: 2}).IsWireGuardCompatible() {
++		t.Fatal("junk params should not be wireguard compatible")
++	}
++	if (Params{H1: "10", H2: "20", H3: "30", H4: "40"}).IsWireGuardCompatible() {
++		t.Fatal("magic headers should not be wireguard compatible")
++	}
++	if (Params{I1: "<b 0x00>"}).IsWireGuardCompatible() {
++		t.Fatal("i-packets should not be wireguard compatible")
++	}
++}
++
++func TestGenerateParamsIsValidAndObfuscating(t *testing.T) {
++	for i := 0; i < 50; i++ {
++		p := GenerateParams()
++		if err := p.Validate(); err != nil {
++			t.Fatalf("GenerateParams() produced invalid params: %v (%+v)", err, p)
++		}
++		if p.IsWireGuardCompatible() {
++			t.Fatalf("GenerateParams() should produce obfuscating params, got %+v", p)
++		}
++		if p.Jmin > p.Jmax {
++			t.Fatalf("Jmin %d > Jmax %d", p.Jmin, p.Jmax)
++		}
++	}
++}
++
++func TestAppendUAPILines(t *testing.T) {
++	p := Params{Jc: 4, Jmin: 40, Jmax: 70, S1: 30, S2: 40, H1: "10", H2: "20", H3: "30", H4: "40", I1: "<b 0x01>"}
++	var sb strings.Builder
++	p.appendUAPILines(&sb)
++	got := sb.String()
++	for _, want := range []string{"jc=4\n", "jmin=40\n", "jmax=70\n", "s1=30\n", "s2=40\n", "h1=10\n", "h4=40\n", "i1=<b 0x01>\n"} {
++		if !strings.Contains(got, want) {
++			t.Fatalf("uapi lines missing %q in:\n%s", want, got)
++		}
++	}
++	if strings.Contains(got, "s3=") || strings.Contains(got, "i2=") {
++		t.Fatalf("unset params should be omitted, got:\n%s", got)
++	}
++}
++
++func TestAppendConfLinesCamelCase(t *testing.T) {
++	p := Params{Jc: 4, Jmin: 40, Jmax: 70, S1: 30, H1: "10", H2: "20", H3: "30", H4: "40"}
++	var sb strings.Builder
++	p.appendConfLines(&sb)
++	got := sb.String()
++	for _, want := range []string{"Jc = 4\n", "Jmin = 40\n", "S1 = 30\n", "H1 = 10\n", "H4 = 40\n"} {
++		if !strings.Contains(got, want) {
++			t.Fatalf("conf lines missing %q in:\n%s", want, got)
++		}
++	}
++}
++
++func TestParseMagicHeader(t *testing.T) {
++	tests := []struct {
++		in      string
++		lo, hi  uint64
++		wantErr bool
++	}{
++		{in: "1148618200", lo: 1148618200, hi: 1148618200},
++		{in: "100-200", lo: 100, hi: 200},
++		{in: "200-100", wantErr: true},
++		{in: "abc", wantErr: true},
++		{in: "5000000000", wantErr: true},
++	}
++	for _, tt := range tests {
++		lo, hi, err := parseMagicHeader(tt.in)
++		if tt.wantErr {
++			if err == nil {
++				t.Fatalf("parseMagicHeader(%q) = nil error, want error", tt.in)
++			}
++			continue
++		}
++		if err != nil || lo != tt.lo || hi != tt.hi {
++			t.Fatalf("parseMagicHeader(%q) = (%d,%d,%v), want (%d,%d,nil)", tt.in, lo, hi, err, tt.lo, tt.hi)
++		}
++	}
++}
+diff --git a/internal/database/model/model.go b/internal/database/model/model.go
+index 47d79d3..19a86ad 100644
+--- a/internal/database/model/model.go
++++ b/internal/database/model/model.go
+@@ -30,6 +30,7 @@ const (
+ 	Shadowsocks Protocol = "shadowsocks"
+ 	Mixed       Protocol = "mixed"
+ 	WireGuard   Protocol = "wireguard"
++	AmneziaWG   Protocol = "amneziawg"
+ 	Hysteria    Protocol = "hysteria"
+ 	MTProto     Protocol = "mtproto"
+ )
+@@ -60,7 +61,7 @@ type Inbound struct {
+ 	// Xray configuration fields
+ 	Listen            string   `json:"listen" form:"listen"`
+ 	Port              int      `json:"port" form:"port" validate:"gte=0,lte=65535" example:"443"`
+-	Protocol          Protocol `json:"protocol" form:"protocol" validate:"required,oneof=vmess vless trojan shadowsocks wireguard hysteria http mixed tunnel tun mtproto" example:"vless"`
++	Protocol          Protocol `json:"protocol" form:"protocol" validate:"required,oneof=vmess vless trojan shadowsocks wireguard amneziawg hysteria http mixed tunnel tun mtproto" example:"vless"`
+ 	Settings          string   `json:"settings" form:"settings"`
+ 	StreamSettings    string   `json:"streamSettings" form:"streamSettings"`
+ 	Tag               string   `json:"tag" form:"tag" gorm:"unique" example:"in-443-tcp"`
+diff --git a/internal/web/job/awg_job.go b/internal/web/job/awg_job.go
+new file mode 100644
+index 0000000..7c0ba79
+--- /dev/null
++++ b/internal/web/job/awg_job.go
+@@ -0,0 +1,74 @@
++package job
++
++import (
++	"github.com/mhsanaei/3x-ui/v3/internal/awg"
++	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
++	"github.com/mhsanaei/3x-ui/v3/internal/logger"
++	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
++	"github.com/mhsanaei/3x-ui/v3/internal/xray"
++)
++
++// AwgJob reconciles the in-process AmneziaWG devices against the enabled
++// amneziawg inbounds in the database and folds the per-peer traffic each device
++// reports into the usual inbound and client traffic accounting. AmneziaWG runs
++// inside the panel (no Xray inbound, no sidecar binary), so its clients would be
++// invisible to traffic limits and usage without this job.
++type AwgJob struct {
++	inboundService service.InboundService
++}
++
++// NewAwgJob creates a new AmneziaWG reconcile/traffic job instance.
++func NewAwgJob() *AwgJob {
++	return new(AwgJob)
++}
++
++// Run reconciles desired amneziawg inbounds with running devices and records
++// traffic deltas for both the inbound and its clients.
++func (j *AwgJob) Run() {
++	inbounds, err := j.inboundService.GetAllInbounds()
++	if err != nil {
++		logger.Warning("awg job: get inbounds failed:", err)
++		return
++	}
++
++	var desired []awg.Instance
++	for _, ib := range inbounds {
++		if ib.Protocol != model.AmneziaWG || !ib.Enable || ib.NodeID != nil {
++			continue
++		}
++		if inst, ok := awg.InstanceFromInbound(ib); ok {
++			desired = append(desired, inst)
++		}
++	}
++
++	mgr := awg.GetManager()
++	mgr.Reconcile(desired)
++
++	deltas := mgr.CollectTraffic()
++	if len(deltas) == 0 {
++		return
++	}
++	inboundByTag := make(map[string]*xray.Traffic)
++	clientTraffics := make([]*xray.ClientTraffic, 0, len(deltas))
++	for _, d := range deltas {
++		agg, ok := inboundByTag[d.Tag]
++		if !ok {
++			agg = &xray.Traffic{IsInbound: true, Tag: d.Tag}
++			inboundByTag[d.Tag] = agg
++		}
++		agg.Up += d.Up
++		agg.Down += d.Down
++		clientTraffics = append(clientTraffics, &xray.ClientTraffic{
++			Email: d.Email,
++			Up:    d.Up,
++			Down:  d.Down,
++		})
++	}
++	traffics := make([]*xray.Traffic, 0, len(inboundByTag))
++	for _, t := range inboundByTag {
++		traffics = append(traffics, t)
++	}
++	if _, _, err := j.inboundService.AddTraffic(traffics, clientTraffics); err != nil {
++		logger.Warning("awg job: add traffic failed:", err)
++	}
++}
+diff --git a/internal/web/runtime/local.go b/internal/web/runtime/local.go
+index be5a960..5e5ce94 100644
+--- a/internal/web/runtime/local.go
++++ b/internal/web/runtime/local.go
+@@ -8,6 +8,7 @@ import (
+ 	"strings"
+ 	"sync"
+ 
++	"github.com/mhsanaei/3x-ui/v3/internal/awg"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/mtproto"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/xray"
+@@ -53,6 +54,13 @@ func (l *Local) AddInbound(_ context.Context, ib *model.Inbound) error {
+ 		}
+ 		return mtproto.GetManager().Ensure(inst)
+ 	}
++	if ib.Protocol == model.AmneziaWG {
++		inst, ok := awg.InstanceFromInbound(ib)
++		if !ok {
++			return nil
++		}
++		return awg.GetManager().Ensure(inst)
++	}
+ 	body, err := json.MarshalIndent(ib.GenXrayInboundConfig(), "", "  ")
+ 	if err != nil {
+ 		return err
+@@ -67,6 +75,10 @@ func (l *Local) DelInbound(_ context.Context, ib *model.Inbound) error {
+ 		mtproto.GetManager().Remove(ib.Id)
+ 		return nil
+ 	}
++	if ib.Protocol == model.AmneziaWG {
++		awg.GetManager().Remove(ib.Id)
++		return nil
++	}
+ 	return l.withAPI(func(api *xray.XrayAPI) error {
+ 		return api.DelInbound(ib.Tag)
+ 	})
+@@ -84,6 +96,9 @@ func (l *Local) AddUser(_ context.Context, ib *model.Inbound, userMap map[string
+ 	if ib.Protocol == model.MTProto {
+ 		return nil
+ 	}
++	if ib.Protocol == model.AmneziaWG {
++		return nil
++	}
+ 	return l.withAPI(func(api *xray.XrayAPI) error {
+ 		return api.AddUser(string(ib.Protocol), ib.Tag, userMap)
+ 	})
+@@ -93,6 +108,9 @@ func (l *Local) RemoveUser(_ context.Context, ib *model.Inbound, email string) e
+ 	if ib.Protocol == model.MTProto {
+ 		return nil
+ 	}
++	if ib.Protocol == model.AmneziaWG {
++		return nil
++	}
+ 	return l.withAPI(func(api *xray.XrayAPI) error {
+ 		return api.RemoveUser(ib.Tag, email)
+ 	})
+diff --git a/internal/web/service/client_inbound_apply.go b/internal/web/service/client_inbound_apply.go
+index f1c0856..8a47c1d 100644
+--- a/internal/web/service/client_inbound_apply.go
++++ b/internal/web/service/client_inbound_apply.go
+@@ -290,7 +290,7 @@ func (s *ClientService) addInboundClient(inboundSvc *InboundService, data *model
+ 		return false, err
+ 	}
+ 
+-	if oldInbound.Protocol == model.WireGuard {
++	if isWireguardFamily(oldInbound.Protocol) {
+ 		existing, gcErr := inboundSvc.GetClients(oldInbound)
+ 		if gcErr != nil {
+ 			return false, gcErr
+@@ -317,7 +317,7 @@ func (s *ClientService) addInboundClient(inboundSvc *InboundService, data *model
+ 			if client.Auth == "" {
+ 				return false, common.NewError("empty client ID")
+ 			}
+-		case "wireguard":
++		case "wireguard", "amneziawg":
+ 			if client.PublicKey == "" {
+ 				return false, common.NewError("wireguard client requires a key")
+ 			}
+@@ -480,7 +480,7 @@ func (s *ClientService) UpdateInboundClient(inboundSvc *InboundService, data *mo
+ 		newClientId = clients[0].Email
+ 	case "hysteria":
+ 		newClientId = clients[0].Auth
+-	case "wireguard":
++	case "wireguard", "amneziawg":
+ 		newClientId = clients[0].Email
+ 	default:
+ 		newClientId = clients[0].ID
+@@ -518,7 +518,7 @@ func (s *ClientService) UpdateInboundClient(inboundSvc *InboundService, data *mo
+ 	// WireGuard keys are never rotated by an edit: when the incoming payload omits
+ 	// them (a metadata-only change), carry the stored credentials forward so the
+ 	// settings JSON and the running peer keep the client's identity.
+-	if oldInbound.Protocol == model.WireGuard && clientIndex >= 0 && clientIndex < len(oldClients) {
++	if isWireguardFamily(oldInbound.Protocol) && clientIndex >= 0 && clientIndex < len(oldClients) {
+ 		old := oldClients[clientIndex]
+ 		if clients[0].PrivateKey == "" {
+ 			clients[0].PrivateKey = old.PrivateKey
+@@ -588,7 +588,7 @@ func (s *ClientService) UpdateInboundClient(inboundSvc *InboundService, data *mo
+ 					newMap["subId"] = random.NumLower(16)
+ 				}
+ 			}
+-			if oldInbound.Protocol == model.WireGuard {
++			if isWireguardFamily(oldInbound.Protocol) {
+ 				newMap["privateKey"] = clients[0].PrivateKey
+ 				newMap["publicKey"] = clients[0].PublicKey
+ 				newMap["allowedIPs"] = clients[0].AllowedIPs
+diff --git a/internal/web/service/client_wireguard.go b/internal/web/service/client_wireguard.go
+index d4736a2..e531c19 100644
+--- a/internal/web/service/client_wireguard.go
++++ b/internal/web/service/client_wireguard.go
+@@ -12,6 +12,13 @@ import (
+ 
+ const defaultWireguardBase = "10.0.0.0/24"
+ 
++// isWireguardFamily reports whether a protocol uses the WireGuard peer/client
++// model: plain WireGuard and AmneziaWG (WireGuard plus packet obfuscation) share
++// the same per-client keypair/address handling, so client CRUD treats them alike.
++func isWireguardFamily(p model.Protocol) bool {
++	return p == model.WireGuard || p == model.AmneziaWG
++}
++
+ func keepAliveStr(seconds int) string {
+ 	if seconds <= 0 {
+ 		return ""
+diff --git a/internal/web/service/inbound.go b/internal/web/service/inbound.go
+index 13079a6..d041d18 100644
+--- a/internal/web/service/inbound.go
++++ b/internal/web/service/inbound.go
+@@ -303,6 +303,10 @@ type InboundOption struct {
+ 	WgPublicKey    string `json:"wgPublicKey,omitempty"`
+ 	WgMtu          int    `json:"wgMtu,omitempty"`
+ 	WgDns          string `json:"wgDns,omitempty"`
++	// AwgParams is the raw AmneziaWG obfuscation object (jc/jmin/jmax/s1-s4/
++	// h1-h4/i1-i5) from an amneziawg inbound's settings, so the clients page can
++	// render a matching client .conf. Empty for non-amneziawg inbounds.
++	AwgParams string `json:"awgParams,omitempty"`
+ 	// Hosting node; nil for this panel's own inbounds. Lets the clients
+ 	// page map a node filter onto inbound IDs (#4997).
+ 	NodeId *int `json:"nodeId,omitempty"`
+@@ -363,6 +367,7 @@ func (s *InboundService) GetInboundOptions(userId int) ([]InboundOption, error)
+ 			WgPublicKey:       wgPublicKey,
+ 			WgMtu:             wgMtu,
+ 			WgDns:             wgDns,
++			AwgParams:         inboundAwgParams(r.Protocol, r.Settings),
+ 			NodeId:            r.NodeId,
+ 			NodeAddress:       r.NodeAddress,
+ 			Listen:            r.Listen,
+@@ -374,7 +379,7 @@ func (s *InboundService) GetInboundOptions(userId int) ([]InboundOption, error)
+ }
+ 
+ func inboundWireguardHints(protocol string, settings string) (string, int, string) {
+-	if protocol != string(model.WireGuard) || strings.TrimSpace(settings) == "" {
++	if (protocol != string(model.WireGuard) && protocol != string(model.AmneziaWG)) || strings.TrimSpace(settings) == "" {
+ 		return "", 0, ""
+ 	}
+ 	var parsed struct {
+@@ -399,6 +404,27 @@ func inboundWireguardHints(protocol string, settings string) (string, int, strin
+ 	return publicKey, parsed.MTU, parsed.DNS
+ }
+ 
++// inboundAwgParams returns the raw AmneziaWG obfuscation object from an
++// amneziawg inbound's settings JSON, so the clients page can render a client
++// .conf whose parameters match the server. It returns "" for other protocols or
++// when no params are present.
++func inboundAwgParams(protocol string, settings string) string {
++	if protocol != string(model.AmneziaWG) || strings.TrimSpace(settings) == "" {
++		return ""
++	}
++	var parsed struct {
++		AWG json.RawMessage `json:"awg"`
++	}
++	if err := json.Unmarshal([]byte(settings), &parsed); err != nil {
++		return ""
++	}
++	trimmed := strings.TrimSpace(string(parsed.AWG))
++	if trimmed == "" || trimmed == "null" {
++		return ""
++	}
++	return trimmed
++}
++
+ // GetAllInbounds retrieves all inbounds with client stats.
+ func (s *InboundService) GetAllInbounds() ([]*model.Inbound, error) {
+ 	db := database.GetDB()
+diff --git a/internal/web/service/port_conflict.go b/internal/web/service/port_conflict.go
+index f36a2f9..ea005c2 100644
+--- a/internal/web/service/port_conflict.go
++++ b/internal/web/service/port_conflict.go
+@@ -20,7 +20,7 @@ const (
+ func inboundTransports(protocol model.Protocol, streamSettings, settings string) transportBits {
+ 	// protocols that ignore streamSettings entirely.
+ 	switch protocol {
+-	case model.Hysteria, model.WireGuard:
++	case model.Hysteria, model.WireGuard, model.AmneziaWG:
+ 		return transportUDP
+ 	case model.MTProto:
+ 		return transportTCP
+diff --git a/internal/web/service/xray.go b/internal/web/service/xray.go
+index 4b84e4c..bb197c5 100644
+--- a/internal/web/service/xray.go
++++ b/internal/web/service/xray.go
+@@ -142,6 +142,9 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
+ 		if inbound.Protocol == model.MTProto {
+ 			continue
+ 		}
++		if inbound.Protocol == model.AmneziaWG {
++			continue
++		}
+ 		settings := map[string]any{}
+ 		_ = json.Unmarshal([]byte(inbound.Settings), &settings)
+ 
+diff --git a/internal/web/translation/ar-EG.json b/internal/web/translation/ar-EG.json
+index 2d127e9..e740047 100644
+--- a/internal/web/translation/ar-EG.json
++++ b/internal/web/translation/ar-EG.json
+@@ -1759,6 +1759,28 @@
+         "psk": "المفتاح المشترك",
+         "domainStrategy": "استراتيجية الدومين"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "اسم واجهة TUN. القيمة الافتراضية هي 'xray0'",
+         "mtuDesc": "وحدة النقل الأقصى. الحد الأقصى لحجم حزم البيانات. القيمة الافتراضية هي 1500",
+diff --git a/internal/web/translation/en-US.json b/internal/web/translation/en-US.json
+index 9a649d9..4007c12 100644
+--- a/internal/web/translation/en-US.json
++++ b/internal/web/translation/en-US.json
+@@ -1875,6 +1875,28 @@
+         "psk": "PreShared Key",
+         "domainStrategy": "Domain Strategy"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "The name of the TUN interface. Default is 'xray0'",
+         "mtuDesc": "Maximum Transmission Unit. The maximum size of data packets. Default is 1500",
+diff --git a/internal/web/translation/es-ES.json b/internal/web/translation/es-ES.json
+index 96ba2c3..76ca266 100644
+--- a/internal/web/translation/es-ES.json
++++ b/internal/web/translation/es-ES.json
+@@ -1759,6 +1759,28 @@
+         "psk": "Clave precompartida",
+         "domainStrategy": "Estrategia de dominio"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "El nombre de la interfaz TUN. El valor predeterminado es 'xray0'",
+         "mtuDesc": "Unidad Máxima de Transmisión. El tamaño máximo de los paquetes de datos. El valor predeterminado es 1500",
+diff --git a/internal/web/translation/fa-IR.json b/internal/web/translation/fa-IR.json
+index 8fcdec9..aa572e6 100644
+--- a/internal/web/translation/fa-IR.json
++++ b/internal/web/translation/fa-IR.json
+@@ -1759,6 +1759,28 @@
+         "psk": "کلید مشترک",
+         "domainStrategy": "استراتژی حل دامنه"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "نام رابط TUN. مقدار پیش‌فرض 'xray0' است",
+         "mtuDesc": "واحد انتقال حداکثر. بیشترین اندازه بسته‌های داده. مقدار پیش‌فرض 1500 است",
+diff --git a/internal/web/translation/id-ID.json b/internal/web/translation/id-ID.json
+index 206aa07..8599b2a 100644
+--- a/internal/web/translation/id-ID.json
++++ b/internal/web/translation/id-ID.json
+@@ -1759,6 +1759,28 @@
+         "psk": "Kunci Pra-Bagi",
+         "domainStrategy": "Strategi Domain"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "Nama antarmuka TUN. Standar adalah 'xray0'",
+         "mtuDesc": "Unit Transmisi Maksimum. Ukuran maksimum paket data. Standar adalah 1500",
+diff --git a/internal/web/translation/ja-JP.json b/internal/web/translation/ja-JP.json
+index 68d1ad8..1ddc4aa 100644
+--- a/internal/web/translation/ja-JP.json
++++ b/internal/web/translation/ja-JP.json
+@@ -1759,6 +1759,28 @@
+         "psk": "共有キー",
+         "domainStrategy": "ドメイン戦略"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "TUN インターフェースの名前。デフォルトは 'xray0' です",
+         "mtuDesc": "最大伝送単位。データパケットの最大サイズ。デフォルトは 1500 です",
+diff --git a/internal/web/translation/pt-BR.json b/internal/web/translation/pt-BR.json
+index 92f7e62..1c04500 100644
+--- a/internal/web/translation/pt-BR.json
++++ b/internal/web/translation/pt-BR.json
+@@ -1759,6 +1759,28 @@
+         "psk": "Chave Pré-Compartilhada",
+         "domainStrategy": "Estratégia de Domínio"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "O nome da interface TUN. O padrão é 'xray0'",
+         "mtuDesc": "Unidade Máxima de Transmissão. O tamanho máximo dos pacotes de dados. O padrão é 1500",
+diff --git a/internal/web/translation/ru-RU.json b/internal/web/translation/ru-RU.json
+index 2d2a9ce..b251faf 100644
+--- a/internal/web/translation/ru-RU.json
++++ b/internal/web/translation/ru-RU.json
+@@ -1759,6 +1759,28 @@
+         "psk": "Общий ключ",
+         "domainStrategy": "Стратегия домена"
+       },
++      "amneziawg": {
++        "title": "Обфускация AmneziaWG",
++        "note": "Эти параметры обфускации должны совпадать на клиенте. Нажмите «Случайно», чтобы сгенерировать согласованный набор.",
++        "randomize": "Случайно",
++        "advanced": "Дополнительно (S3/S4, магические заголовки, мусорные пакеты)",
++        "jc": "Количество мусорных пакетов (Jc)",
++        "jmin": "Мин. размер мусорного пакета (Jmin)",
++        "jmax": "Макс. размер мусорного пакета (Jmax)",
++        "s1": "Размер мусора init-пакета (S1)",
++        "s2": "Размер мусора ответного пакета (S2)",
++        "s3": "Размер мусора cookie-ответа (S3)",
++        "s4": "Размер мусора транспортного пакета (S4)",
++        "h1": "Магический заголовок 1 (H1)",
++        "h2": "Магический заголовок 2 (H2)",
++        "h3": "Магический заголовок 3 (H3)",
++        "h4": "Магический заголовок 4 (H4)",
++        "i1": "Мусорный пакет I1",
++        "i2": "Мусорный пакет I2",
++        "i3": "Мусорный пакет I3",
++        "i4": "Мусорный пакет I4",
++        "i5": "Мусорный пакет I5"
++      },
+       "tun": {
+         "nameDesc": "Имя интерфейса TUN. Значение по умолчанию - 'xray0'",
+         "mtuDesc": "Максимальная единица передачи. Максимальный размер пакетов данных. Значение по умолчанию - 1500",
+diff --git a/internal/web/translation/tr-TR.json b/internal/web/translation/tr-TR.json
+index d9c73e4..b6b742e 100644
+--- a/internal/web/translation/tr-TR.json
++++ b/internal/web/translation/tr-TR.json
+@@ -1759,6 +1759,28 @@
+         "psk": "Ön Paylaşılan Anahtar",
+         "domainStrategy": "Alan Adı Stratejisi"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "TUN arabiriminin adı. Varsayılan değer 'xray0'dır.",
+         "mtuDesc": "Maksimum İletim Birimi. Veri paketlerinin maksimum boyutu. Varsayılan değer 1500'dür.",
+diff --git a/internal/web/translation/uk-UA.json b/internal/web/translation/uk-UA.json
+index a08e6c6..49e6964 100644
+--- a/internal/web/translation/uk-UA.json
++++ b/internal/web/translation/uk-UA.json
+@@ -1759,6 +1759,28 @@
+         "psk": "Спільний ключ",
+         "domainStrategy": "Стратегія домену"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "Назва інтерфейсу TUN. Значення за замовчуванням - 'xray0'",
+         "mtuDesc": "Максимальна одиниця передачі. Максимальний розмір пакетів даних. Значення за замовчуванням - 1500",
+diff --git a/internal/web/translation/vi-VN.json b/internal/web/translation/vi-VN.json
+index 82f320e..8c1f824 100644
+--- a/internal/web/translation/vi-VN.json
++++ b/internal/web/translation/vi-VN.json
+@@ -1759,6 +1759,28 @@
+         "psk": "Khóa chia sẻ",
+         "domainStrategy": "Chiến lược tên miền"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "Tên của giao diện TUN. Giá trị mặc định là 'xray0'",
+         "mtuDesc": "Đơn vị Truyền Tối đa. Kích thước tối đa của các gói dữ liệu. Giá trị mặc định là 1500",
+diff --git a/internal/web/translation/zh-CN.json b/internal/web/translation/zh-CN.json
+index a00a25c..d2e1795 100644
+--- a/internal/web/translation/zh-CN.json
++++ b/internal/web/translation/zh-CN.json
+@@ -1759,6 +1759,28 @@
+         "psk": "共享密钥",
+         "domainStrategy": "域策略"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "TUN 接口的名称。默认值为 'xray0'",
+         "mtuDesc": "最大传输单元。数据包的最大大小。默认值为 1500",
+diff --git a/internal/web/translation/zh-TW.json b/internal/web/translation/zh-TW.json
+index dee558f..30c9b6d 100644
+--- a/internal/web/translation/zh-TW.json
++++ b/internal/web/translation/zh-TW.json
+@@ -1759,6 +1759,28 @@
+         "psk": "共享金鑰",
+         "domainStrategy": "域策略"
+       },
++      "amneziawg": {
++        "title": "AmneziaWG Obfuscation",
++        "note": "These obfuscation parameters must match on the client. Use Randomize to generate a matching set.",
++        "randomize": "Randomize",
++        "advanced": "Advanced (S3/S4, magic headers, junk packets)",
++        "jc": "Junk packet count (Jc)",
++        "jmin": "Junk packet min size (Jmin)",
++        "jmax": "Junk packet max size (Jmax)",
++        "s1": "Init packet junk size (S1)",
++        "s2": "Response packet junk size (S2)",
++        "s3": "Cookie reply junk size (S3)",
++        "s4": "Transport packet junk size (S4)",
++        "h1": "Magic header 1 (H1)",
++        "h2": "Magic header 2 (H2)",
++        "h3": "Magic header 3 (H3)",
++        "h4": "Magic header 4 (H4)",
++        "i1": "Junk packet I1",
++        "i2": "Junk packet I2",
++        "i3": "Junk packet I3",
++        "i4": "Junk packet I4",
++        "i5": "Junk packet I5"
++      },
+       "tun": {
+         "nameDesc": "TUN 介面的名稱。預設值為 'xray0'",
+         "mtuDesc": "最大傳輸單元。資料包的最大大小。預設值為 1500",
+diff --git a/internal/web/web.go b/internal/web/web.go
+index 33c400e..885ab44 100644
+--- a/internal/web/web.go
++++ b/internal/web/web.go
+@@ -16,6 +16,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/mhsanaei/3x-ui/v3/internal/awg"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/config"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/eventbus"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
+@@ -288,6 +289,7 @@ const (
+ 	cadenceXrayRestart   = "@every 30s"
+ 	cadenceXrayTraffic   = "@every 5s"
+ 	cadenceMtproto       = "@every 10s"
++	cadenceAwg           = "@every 10s"
+ 	cadenceClientIPScan  = "@every 10s"
+ 	cadenceNodeHeartbeat = "@every 5s"
+ 	cadenceNodeTraffic   = "@every 5s"
+@@ -331,6 +333,11 @@ func (s *Server) startTask(restartXray bool) {
+ 	_, _ = s.cron.AddJob(cadenceMtproto, mtJob)
+ 	go mtJob.Run()
+ 
++	// Reconcile in-process AmneziaWG devices and fold their per-peer traffic
++	awgJob := job.NewAwgJob()
++	_, _ = s.cron.AddJob(cadenceAwg, awgJob)
++	go awgJob.Run()
++
+ 	// check client ips from log file every 10 sec
+ 	_, _ = s.cron.AddJob(cadenceClientIPScan, job.NewCheckClientIpJob())
+ 
+@@ -683,6 +690,7 @@ func (s *Server) stop(stopXray bool, stopTgBot bool) error {
+ 	if stopXray {
+ 		_ = s.xrayService.StopXray()
+ 		mtproto.GetManager().StopAll()
++		awg.GetManager().StopAll()
+ 	}
+ 	if s.cron != nil {
+ 		s.cron.Stop()
