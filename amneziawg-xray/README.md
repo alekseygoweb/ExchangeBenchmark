@@ -71,7 +71,9 @@
 | `add-client.sh` | Добавляет клиента (ключи, `[Peer]`, клиентский `.conf` + QR). |
 | `bridge/99-awg-xray.conf` | `ip_forward`, `rp_filter=loose`. |
 | `bridge/awg-xray-bridge.sh` | Рантайм: `ip rule`, `ip route table 100`, `FORWARD`. |
-| `bridge/awg-xray-bridge.{service,path}` | Применяют мост при появлении `xray0` и при каждом рестарте Xray. |
+| `bridge/awg-xray-bridge.service` | Oneshot, запускает скрипт моста. |
+| `bridge/99-awg-xray.rules` | udev: (пере)настроить мост при появлении `xray0` (рестарт Xray). |
+| `bridge/awg-xray-bridge.timer` | Страховка: перепроверяет маршрут раз в 30 с. |
 
 Все скрипты идемпотентны и запускаются от `root`.
 
@@ -139,9 +141,10 @@ ip link show xray0        # интерфейс существует
 sudo bash setup-bridge.sh
 ```
 
-Ставит `ip_forward`/`rp_filter`, скрипт моста и systemd-юниты. Юнит
-`awg-xray-bridge.path` следит за `xray0` и **автоматически** восстанавливает
-маршрут при каждом рестарте Xray (панель пересоздаёт `xray0`).
+Ставит `ip_forward`/`rp_filter`, скрипт моста, systemd-юниты и udev-правило.
+udev-правило **мгновенно** восстанавливает маршрут при каждом рестарте Xray
+(панель пересоздаёт `xray0`), а таймер раз в 30 с — страховка на случай
+пропущенного события.
 
 ### 4. Открыть порт AmneziaWG
 
@@ -217,7 +220,7 @@ AmneziaWG-сервера (так же делают `amneziawg-install`, `awg-man
 awg show awg0                     # у пира растут rx/tx, свежий handshake
 ip rule | grep 10.9.9             # from 10.9.9.0/24 lookup 100
 ip route show table 100           # default dev xray0
-systemctl status awg-xray-bridge.path
+systemctl status awg-xray-bridge.timer
 ```
 
 На клиенте: открывается интернет, а «мой IP» показывает egress Xray
@@ -233,7 +236,7 @@ systemctl status awg-xray-bridge.path
 | Пакеты уходят, ответов нет | Строгий `rp_filter` рубит обратный трафик из `xray0`. Убедитесь, что `sysctl net.ipv4.conf.all.rp_filter = 2` (файл `bridge/99-awg-xray.conf`). |
 | Трафик уходит, но не через Xray (обычный egress) | Проверьте, что нет лишнего `MASQUERADE` от `awg0` и что `ip rule` действительно ведёт в `table 100 → dev xray0`. |
 | Зацикливание / Xray не достаёт uplink | В `xray0` не должно попадать `0.0.0.0/0` (только `from 10.9.9.0/24`). Как страховка — задайте `autoOutboundsInterface: "eth0"` в инбаунде. |
-| После рестарта Xray интернет у клиентов пропал | `xray0` пересоздался. Юнит `awg-xray-bridge.path` должен вернуть маршрут; если нет — `systemctl status awg-xray-bridge.path` и `journalctl -u awg-xray-bridge.service`. |
+| После рестарта Xray интернет у клиентов пропал | `xray0` пересоздался, маршрут в table 100 слетел. udev + таймер должны вернуть его за ≤30 с; немедленно — `systemctl start awg-xray-bridge.service`. Диагностика: `ip route show table 100`, `journalctl -u awg-xray-bridge.service`. Симптом в `awg show`: `received` растёт, `sent` почти ноль (обратный путь оборван). |
 | Медленно/рвётся на части сайтов | MTU. Оставьте `MTU=1280` в конфигах AmneziaWG (уже задано). |
 | Клиент не коннектится вовсе | Параметры обфускации на клиенте и сервере должны совпадать байт-в-байт; порт UDP открыт; клиент — именно AmneziaWG, а не WireGuard. |
 | `FORWARD` рубит трафик (политика DROP) | Мост добавляет `ACCEPT` для `awg0↔xray0`. Проверьте `iptables -S FORWARD`. |
@@ -245,15 +248,16 @@ systemctl status awg-xray-bridge.path
 
 ## Персистентность и откат
 
-- `awg-quick@awg0` и `awg-xray-bridge.path` включены (`enable`) → переживают
-  перезагрузку. `rp_filter`/`ip_forward` — в `/etc/sysctl.d/`.
+- `awg-quick@awg0` и `awg-xray-bridge.timer` включены (`enable`) → переживают
+  перезагрузку. udev-правило + `rp_filter`/`ip_forward` — в `/etc/`.
 - **Откат моста:**
   ```bash
-  systemctl disable --now awg-xray-bridge.path awg-xray-bridge.service
+  systemctl disable --now awg-xray-bridge.timer awg-xray-bridge.service
+  rm -f /etc/udev/rules.d/99-awg-xray.rules && udevadm control --reload-rules
   ip rule del from 10.9.9.0/24 table 100 2>/dev/null || true
   ip route flush table 100 2>/dev/null || true
   rm -f /etc/sysctl.d/99-awg-xray.conf /usr/local/sbin/awg-xray-bridge.sh \
-        /etc/systemd/system/awg-xray-bridge.{service,path}
+        /etc/systemd/system/awg-xray-bridge.{service,timer}
   systemctl daemon-reload
   ```
 - **Удалить AmneziaWG:** `systemctl disable --now awg-quick@awg0`, затем удалить

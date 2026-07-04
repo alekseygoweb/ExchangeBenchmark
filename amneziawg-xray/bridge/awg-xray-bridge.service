@@ -1,6 +1,6 @@
 [Unit]
 Description=AmneziaWG -> Xray (tun xray0) routing bridge
-# Запускается при появлении интерфейса xray0 (см. awg-xray-bridge.path),
+# Дёргается udev-правилом при появлении xray0 и таймером awg-xray-bridge.timer,
 # а также вручную: systemctl start awg-xray-bridge.service
 After=network-online.target
 Wants=network-online.target

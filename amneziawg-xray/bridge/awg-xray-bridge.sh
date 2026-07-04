@@ -5,10 +5,11 @@
 # Заворачивает трафик клиентов AmneziaWG (интерфейс awg0) во входящий
 # Xray 'tun' (интерфейс xray0), чтобы им занималась маршрутизация/outbounds Xray.
 #
-# Идемпотентно. Вызывается systemd-юнитом awg-xray-bridge.service, который
-# запускается по появлению интерфейса xray0 (awg-xray-bridge.path). При каждом
-# перезапуске Xray интерфейс xray0 пересоздаётся -> маршрут в таблице RT_TABLE
-# нужно проставить заново, что и делает этот скрипт.
+# Идемпотентно. Запускается через awg-xray-bridge.service, который дёргается:
+#   * udev-правилом при появлении интерфейса xray0 (мгновенно, надёжно),
+#   * таймером awg-xray-bridge.timer раз в 30 с (страховка).
+# При каждом перезапуске Xray интерфейс xray0 пересоздаётся -> маршрут в таблице
+# RT_TABLE нужно проставить заново, что и делает этот скрипт.
 #
 # Схема пакета (клиент -> сайт):
 #   awg0(10.9.9.x) --[ip rule from 10.9.9.0/24 -> table 100]--> default dev xray0
@@ -37,7 +38,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-# xray0 должен существовать (юнит .path это гарантирует, но проверим).
+# xray0 должен существовать (udev дёргает нас по его появлению, но проверим).
 if ! ip link show "$TUN_IF" >/dev/null 2>&1; then
   log "Интерфейс $TUN_IF ещё не создан (Xray с tun-инбаундом не запущен?) — выходим."
   exit 0
@@ -61,7 +62,11 @@ if ! ip rule show | grep -q "from ${AWG_SUBNET} lookup ${RT_TABLE}"; then
 fi
 
 # 4) Дефолтный маршрут таблицы RT_TABLE — в xray0 (весь трафик клиентов в Xray).
-ip route replace default dev "$TUN_IF" table "$RT_TABLE"
+#    Если xray0 ещё не до конца поднят — не роняем сервис, повторит таймер/udev.
+if ! ip route replace default dev "$TUN_IF" table "$RT_TABLE"; then
+  log "Маршрут пока не удалось поставить (${TUN_IF} не готов?) — повтор по таймеру/udev."
+  exit 0
+fi
 log "Маршрут: default dev ${TUN_IF} table ${RT_TABLE}"
 
 # 5) FORWARD: разрешаем пересылку awg0 <-> xray0 (на случай политики DROP).
