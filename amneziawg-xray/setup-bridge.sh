@@ -25,11 +25,11 @@ for f in 99-awg-xray.conf awg-xray-bridge.sh awg-xray-bridge.service \
 done
 
 # --- Миграция со старого механизма (.path на sysfs — ненадёжен) ---
-if systemctl list-unit-files 2>/dev/null | grep -q '^awg-xray-bridge\.path'; then
-  log "Убираю старый awg-xray-bridge.path (заменён на udev + timer)"
-  systemctl disable --now awg-xray-bridge.path 2>/dev/null || true
-  rm -f /etc/systemd/system/awg-xray-bridge.path
-fi
+# Безусловно (не через if с pipefail-проверкой, которая могла пропускать блок).
+log "Убираю старый awg-xray-bridge.path, если остался (заменён на udev + timer)"
+systemctl disable --now awg-xray-bridge.path 2>/dev/null || true
+rm -f /etc/systemd/system/awg-xray-bridge.path \
+      /etc/systemd/system/*.wants/awg-xray-bridge.path
 
 log "Параметры ядра -> /etc/sysctl.d/99-awg-xray.conf"
 install -m 0644 "${SRC}/99-awg-xray.conf" /etc/sysctl.d/99-awg-xray.conf
