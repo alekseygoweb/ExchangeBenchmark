@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch for Xray tun interface (xray0) and (re)apply AmneziaWG bridge
+# Срабатывает, когда появляется /sys/class/net/xray0. Xray создаёт этот
+# интерфейс при старте tun-инбаунда; при перезапуске Xray интерфейс
+# пересоздаётся -> путь исчезает и появляется снова -> сервис запускается
+# заново и восстанавливает маршрут в таблице маршрутизации.
+
+[Path]
+PathExists=/sys/class/net/xray0
+Unit=awg-xray-bridge.service
+
+[Install]
+WantedBy=multi-user.target

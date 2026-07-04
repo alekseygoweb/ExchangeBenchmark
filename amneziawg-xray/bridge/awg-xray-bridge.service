@@ -1,0 +1,16 @@
+[Unit]
+Description=AmneziaWG -> Xray (tun xray0) routing bridge
+# Запускается при появлении интерфейса xray0 (см. awg-xray-bridge.path),
+# а также вручную: systemctl start awg-xray-bridge.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/awg-xray-bridge.sh
+RemainAfterExit=no
+# Если xray0 ещё не готов — не считаем это фатальной ошибкой.
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target
