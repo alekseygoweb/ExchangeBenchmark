@@ -213,11 +213,10 @@ SPECS = [
           ws="wss://api.upbit.com/websocket/v1",
           sub=json.dumps([{"ticket": "lt-probe"},
                           {"type": "ticker", "codes": ["KRW-BTC"]}]),
-          ack=_ack_upbit, ping=None, pace=0.25,
+          ack=_ack_upbit, ping=None, no_ping=True, pace=0.25,
           note="AWS Seoul (ap-northeast-2), прямой EC2 (без CDN); WS-кадры бинарные JSON. "
-               "pace=0.25 — rate-limit (429); ping — управляющий RFC6455 (надёжен ИЗ "
-               "региона биржи: из Сеула ~7 мс; из далёких точек может не ответить — "
-               "тогда ориентир по Подписке)"),
+               "pace=0.25 — rate-limit (429); ping «—»: Подписка уже меряет RTT до движка "
+               "(из Сеула ~7 мс), а клиентский ping Upbit отвечает лишь из региона"),
 
     # --- Референс: биржи, уже поддержанные в latency_test.py ---
     _spec(key="binance", name="Binance global (spot)", market="spot",
@@ -429,6 +428,8 @@ def measure_ping(spec, n, timeout):
     управляющий WS-ping (RFC6455)."""
     if not WS_OK:
         raise RuntimeError("нет websocket-client")
+    if spec.get("no_ping"):                             # биржа не отвечает на клиентский ping
+        return None                                     # → «—»; ориентир по этой бирже — Подписка
     # Пингуем БЕЗ подписки: иначе поток данных канала копится в сокете и «прогрёб»
     # этого бэклога раздувает замер pong (заметно на чатных каналах, напр. Upbit).
     ws = create_connection(spec["ws"], timeout=timeout,
