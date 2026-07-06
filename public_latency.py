@@ -110,6 +110,12 @@ def _ack_bingx(o, t):        # ack {"code":0,...} или первый data-ка�
 def _ack_coinbase(o, t):     # {"type":"subscriptions",...}
     return isinstance(o, dict) and o.get("type") == "subscriptions"
 
+def _ack_upbit(o, t):        # Upbit не шлёт ack — сразу поток; ловим первый ticker
+    return isinstance(o, dict) and (o.get("type") == "ticker" or o.get("code"))
+
+def _pong_upbit(o, t):       # ответ на "PING": {"status":"UP"}
+    return isinstance(o, dict) and o.get("status") == "UP"
+
 
 # =========================================================================== #
 #                        Спецификации бирж                                    #
@@ -201,6 +207,14 @@ SPECS = [
           sub=json.dumps({"op": "subscribe", "args": [
               {"instType": "SPOT", "channel": "ticker", "instId": "BTCUSDT"}]}),
           ack=_ack_bitget, ping="ping", pong=_pong_text),
+
+    _spec(key="upbit", name="Upbit (spot, KRW)", market="spot",
+          rest="https://api.upbit.com/v1/ticker?markets=KRW-BTC",
+          ws="wss://api.upbit.com/websocket/v1",
+          sub=json.dumps([{"ticket": "lt-probe"},
+                          {"type": "ticker", "codes": ["KRW-BTC"]}]),
+          ack=_ack_upbit, ping="PING", pong=_pong_upbit,
+          note="AWS Seoul (ap-northeast-2), прямой EC2 (без CDN); WS-кадры бинарные JSON"),
 
     # --- Референс: биржи, уже поддержанные в latency_test.py ---
     _spec(key="binance", name="Binance global (spot)", market="spot",

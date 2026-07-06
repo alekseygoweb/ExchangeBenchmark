@@ -1,0 +1,19 @@
+{
+    "name": "Upbit (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи из .env (UPBIT_API_KEY / UPBIT_API_SECRET). Авторизация JWT (HS256). Только спот, рынок KRW (символ KRW-BTC). Матчинг-движок — AWS Seoul (ap-northeast-2), прямой EC2 без CDN. Мин. ордер 5000 KRW. WS-размещения ордеров нет — замер только REST. Нужен верифицированный аккаунт с KRW-балансом.",
+
+    "base_url": "https://api.upbit.com",
+    "timeout_sec": 10,
+
+    "auto_price": true,
+    "price_offset_pct": 1.0,
+    "auto_size": true,
+
+    "spot": {
+        "symbol": "KRW-BTC",
+        "side": "buy",
+        "price": "50000000",
+        "size": "0.0001",
+        "min_notional_krw": 5000
+    }
+}

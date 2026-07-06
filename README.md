@@ -1,9 +1,9 @@
 # ExchangeBenchmark
 
 Замер задержки торговых операций на **Binance**, **OKX**, **MEXC**,
-**Binance.US**, **Bybit**, **Bitget**, **BingX** и **Coinbase** (фьючерсы и
-спот, где есть), по двум транспортам — **REST API** и **WebSocket**, в двух
-режимах — **обычный лимитный** ордер и **условный (trigger/algo)** ордер.
+**Binance.US**, **Bybit**, **Bitget**, **BingX**, **Coinbase** и **Upbit**
+(фьючерсы и спот, где есть), по двум транспортам — **REST API** и **WebSocket**,
+в двух режимах — **обычный лимитный** ордер и **условный (trigger/algo)** ордер.
 
 - `latency_test.py` — цикл «разместить ордер → отменить ордер», считает задержку
   размещения, отмены и суммы (мс) по каждой бирже / рынку / транспорту.
@@ -24,12 +24,19 @@
 |---|---|---|---|
 | Coinbase Exchange (спот) | AWS **us-east-1** | Сев. Вирджиния | ✅ офиц. + DNS |
 | Binance.US | AWS **us-east-1** | Сев. Вирджиния | ✅ прямой DNS |
-| Bybit | AWS **ap-southeast-1** (AZ `apse1-az2/az3`) | Сингапур | ✅ офиц. FAQ |
-| MEXC | AWS **ap-northeast-1** | Токио | ⚠ замеры/доки |
-| Bitget | AWS **ap-northeast-1** | Токио | ⚠ замеры |
-| BingX | не публикуется (за CloudFront) | Азия? | ❌ только замер |
+| Bybit | AWS **ap-southeast-1** (AZ `apse1-az2/az3`) | Сингапур | ✅ офиц. + замер |
+| BingX | AWS **ap-southeast-1** | Сингапур | ✅ замер (6 точек) |
+| MEXC | AWS **ap-northeast-1** | Токио | ✅ замер (6 точек) |
+| Bitget | AWS **ap-northeast-1** | Токио | ✅ замер (6 точек) |
+| Upbit | AWS **ap-northeast-2** (прямой EC2, без CDN) | Сеул | ✅ прямой DNS |
 | Binance global | AWS **ap-northeast-1** | Токио | ✅ офиц. |
-| OKX | AWS/собств. | Гонконг/Сингапур | ⚠ замеры |
+| OKX | AWS **ap-east-1** | Гонконг | ✅ замер (6 точек) |
+
+Замеры `public_latency.py` из шести точек (Вирджиния/Токио/Гонконг/Тайвань/Сеул/
+Сингапур) подтвердили локации по минимуму задержки подписки: Coinbase/Binance.US
+≈6–7 мс из Вирджинии; MEXC/Bitget ≈4–7 мс из Токио; **Bybit и BingX ≈3–4 мс из
+Сингапура** (BingX оказался в Сингапуре, а не в Токио, как писали блоги); OKX
+≈5 мс из Гонконга; Upbit — прямой EC2 в Сеуле (`ap-northeast-2`).
 
 Практика: **два сервера — AWS us-east-1 (Coinbase, Binance.US) и AWS Tokyo
 ap-northeast-1 (Binance, MEXC, Bitget, BingX?)**, плюс, если критичен Bybit, —
@@ -151,7 +158,7 @@ LATENCY_CONFIRM=1 python3 latency_test.py --exchange binance --market spot --rep
 
 | Флаг | Назначение |
 |---|---|
-| `--exchange all\|both\|binance\|okx\|mexc\|binanceus\|bybit\|bitget\|bingx\|coinbase` | Какую биржу гонять. `both` = Binance/OKX/MEXC (как раньше); `all` = все биржи; либо имя одной |
+| `--exchange all\|both\|binance\|okx\|mexc\|binanceus\|bybit\|bitget\|bingx\|coinbase\|upbit` | Какую биржу гонять. `both` = Binance/OKX/MEXC (как раньше); `all` = все биржи; либо имя одной |
 | `--market both\|spot\|futures` | Какой рынок (по умолчанию оба) |
 | `--repeats N` | Число повторов цикла (перекрывает `LATENCY_REPEATS`) |
 | `--auto-price` | Авто-цена от рынка (по умолчанию включена в обычных конфигах) |

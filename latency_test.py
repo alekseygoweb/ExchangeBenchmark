@@ -105,6 +105,7 @@ CONFIG_BYBIT = os.environ.get("CONFIG_BYBIT", "config_bybit_PROD.json")
 CONFIG_BITGET = os.environ.get("CONFIG_BITGET", "config_bitget_PROD.json")
 CONFIG_BINGX = os.environ.get("CONFIG_BINGX", "config_bingx_PROD.json")
 CONFIG_COINBASE = os.environ.get("CONFIG_COINBASE", "config_coinbase_PROD.json")
+CONFIG_UPBIT = os.environ.get("CONFIG_UPBIT", "config_upbit_PROD.json")
 
 
 def _require_env(name):
@@ -171,6 +172,10 @@ def bingx_credentials():
 def coinbase_credentials():
     return (_require_env("COINBASE_API_KEY"), _require_env("COINBASE_API_SECRET"),
             _require_env("COINBASE_API_PASSPHRASE"))
+
+
+def upbit_credentials():
+    return _require_env("UPBIT_API_KEY"), _require_env("UPBIT_API_SECRET")
 
 
 def load_config(path):
@@ -1403,6 +1408,91 @@ class CoinbaseRest:
 
 
 # =========================================================================== #
+#                        Upbit (спот, KRW)                                    #
+# =========================================================================== #
+# Крупнейшая биржа Кореи, api.upbit.com — прямой EC2 в AWS Seoul (ap-northeast-2),
+# без CDN. Авторизация — JWT (HS256): Authorization: Bearer <jwt>, где payload =
+# {access_key, nonce, [query_hash=SHA512(query), query_hash_alg=SHA512]}. Собираем
+# JWT вручную (hmac+base64), без зависимости PyJWT. WS-размещения ордеров нет —
+# замер только REST. Котировка KRW; отмена ордера по нашему identifier.
+UPBIT_BASE = "https://api.upbit.com"
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _upbit_jwt(key, secret, query=""):
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"},
+                                separators=(",", ":")).encode())
+    payload = {"access_key": key, "nonce": uuid.uuid4().hex}
+    if query:
+        payload["query_hash"] = hashlib.sha512(query.encode()).hexdigest()
+        payload["query_hash_alg"] = "SHA512"
+    payload_b64 = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    signing = f"{header}.{payload_b64}".encode()
+    sig = _b64url(hmac.new(secret.encode(), signing, hashlib.sha256).digest())
+    return f"{header}.{payload_b64}.{sig}"
+
+
+class UpbitRest:
+    def __init__(self, cfg, market):
+        self.cfg = cfg
+        self.market = market
+        self.base = cfg.get("base_url", UPBIT_BASE).rstrip("/")
+        self.key = cfg["api_key"]
+        self.secret = cfg["api_secret"]
+        self.timeout = cfg.get("timeout_sec", 10)
+        self.symbol = cfg["symbol"]                      # KRW-BTC
+        self.session = requests.Session()
+
+    def _auth(self, query=""):
+        return {"Authorization": "Bearer " + _upbit_jwt(self.key, self.secret, query)}
+
+    def _send(self, method, path, params=None):
+        query = urlencode(params) if params else ""
+        url = self.base + path + ("?" + query if query else "")
+        r = self.session.request(method, url, headers=self._auth(query), timeout=self.timeout)
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"Upbit {r.status_code} {path}: не-JSON {r.text[:160]!r}")
+        if r.status_code >= 400 or (isinstance(data, dict) and data.get("error")):
+            raise RuntimeError(f"Upbit {path}: {data}")
+        return data
+
+    def place_order(self):
+        cl = gen_cl_id()
+        params = {
+            "market": self.symbol,
+            "side": "bid" if str(self.cfg.get("side", "buy")).lower().startswith("b") else "ask",
+            "ord_type": "limit",
+            "price": str(self.cfg["price"]),
+            "volume": str(self.cfg["size"]),
+            "identifier": cl,
+        }
+        self._send("POST", "/v1/orders", params)
+        _remember(("upbit", self.market), cl)            # отмена по identifier
+        return cl
+
+    def cancel_order(self, cl):
+        self._send("DELETE", "/v1/order", {"identifier": cl})
+
+    def available_usdt(self):                            # у Upbit котировка KRW
+        data = self._send("GET", "/v1/accounts")
+        for a in (data if isinstance(data, list) else []):
+            if a.get("currency") == "KRW":
+                return float(a.get("balance", 0) or 0)
+        return 0.0
+
+    def position_amt(self):
+        return 0.0                                        # спот — позиций нет
+
+    def reconcile(self):
+        return _reconcile_registry(self, ("upbit", self.market))
+
+
+# =========================================================================== #
 #               Авто-цена: безопасный неисполняемый лимит                     #
 # =========================================================================== #
 # Идея: вместо ручной подгонки "price" в конфиге считаем цену от текущего
@@ -1805,6 +1895,10 @@ def server_time_ms(exch, base, is_futures, simulated, timeout):
     if exch == "coinbase":
         d = requests.get(base + "/time", timeout=timeout).json()
         return int(float(d["epoch"]) * 1000)
+    if exch == "upbit":
+        # У Upbit нет публичного server-time; JWT использует nonce, не время —
+        # сверять часы не нужно.
+        raise RuntimeError("у Upbit нет server-time (JWT по nonce) — пропуск")
     headers = {"x-simulated-trading": "1"} if simulated else {}
     d = requests.get(base + "/api/v5/public/time", headers=headers, timeout=timeout).json()
     return int(d["data"][0]["ts"])
@@ -1825,7 +1919,7 @@ def time_sync_preflight(markets):
             cfg = {"binance": binance_cfg, "okx": okx_cfg, "mexc": mexc_cfg,
                    "binanceus": binanceus_cfg, "bybit": bybit_cfg,
                    "bitget": bitget_cfg, "bingx": bingx_cfg,
-                   "coinbase": coinbase_cfg}[exch](market)
+                   "coinbase": coinbase_cfg, "upbit": upbit_cfg}[exch](market)
             t0 = now_ms()
             srv = server_time_ms(exch, cfg.get("base_url", ""), market == "futures",
                                  cfg.get("simulated", False), cfg.get("timeout_sec", 10))
@@ -2093,6 +2187,13 @@ def coinbase_cfg(market):
     return cfg
 
 
+def upbit_cfg(market):
+    full = load_config(CONFIG_UPBIT)
+    cfg = {**_shared_cfg(full, _SHARED_KEYS), **full[market]}
+    cfg["api_key"], cfg["api_secret"] = upbit_credentials()
+    return cfg
+
+
 # ---- Bybit ----
 def _bybit_instrument(cfg, market):
     base = cfg.get("base_url", "https://api.bybit.com").rstrip("/")
@@ -2264,6 +2365,38 @@ def coinbase_min_size(cfg):
                                  step, p.get("min_market_funds") or 0)
 
 
+# ---- Upbit ----
+def _upbit_tick(price):
+    """Шаг цены KRW-рынка Upbit (тик зависит от диапазона цены). BTC (~90M KRW)
+    → тик 1000. BUY округляем вниз, ордер заведомо неисполняемый."""
+    p = float(price)
+    for thr, tick in ((2_000_000, 1000), (1_000_000, 500), (500_000, 100),
+                      (100_000, 50), (10_000, 10), (1_000, 5), (100, 1),
+                      (10, 0.1), (1, 0.01), (0.1, 0.001)):
+        if p >= thr:
+            return tick
+    return 0.0001
+
+
+def upbit_safe_price(cfg, offset):
+    base = cfg.get("base_url", UPBIT_BASE).rstrip("/")
+    r = requests.get(base + "/v1/orderbook", params={"markets": cfg["symbol"]},
+                     timeout=cfg.get("timeout_sec", 10)).json()
+    if not r or not r[0].get("orderbook_units"):
+        raise RuntimeError(f"Upbit orderbook: {r}")
+    unit = r[0]["orderbook_units"][0]
+    bid, ask = float(unit["bid_price"]), float(unit["ask_price"])
+    return _compute_price(cfg, bid, ask, _upbit_tick(bid), offset)
+
+
+def upbit_min_size(cfg):
+    """Минимальный ордер Upbit — 5000 KRW; объём = 5000/цена, округлённый вверх
+    к шагу объёма (8 знаков)."""
+    min_krw = float(cfg.get("min_notional_krw", 5000))
+    return _min_qty_for_notional(float(cfg["price"]), "0.00000001",
+                                 "0.00000001", min_krw)
+
+
 # =========================================================================== #
 #                 Прогон дополнительных бирж (обычный лимит)                   #
 # =========================================================================== #
@@ -2336,6 +2469,20 @@ def run_coinbase(market, transport):
     return measure(c.place_order, c.cancel_order)
 
 
+def run_upbit(market, transport):
+    cfg = upbit_cfg(market)
+    if auto_price_on(cfg):
+        cfg["price"] = _auto_price(("Upbit", market),
+                                   lambda: upbit_safe_price(cfg, price_offset(cfg)))
+    if auto_size_on(cfg):
+        cfg["size"] = _auto_size(("Upbit", market), lambda: upbit_min_size(cfg))
+    if transport != "API":
+        raise RuntimeError("Upbit: размещение ордеров только через REST "
+                           "(WS-API размещения у Upbit нет)")
+    c = UpbitRest(cfg, market)
+    return measure(c.place_order, c.cancel_order)
+
+
 # Построение клиента для reconcile/preflight по имени биржи.
 _CFG_LOADERS = {
     "binance": lambda m: (BinanceRest, binance_cfg(m), m),
@@ -2346,11 +2493,12 @@ _CFG_LOADERS = {
     "bitget": lambda m: (BitgetRest, bitget_cfg(m), m),
     "bingx": lambda m: (BingxRest, bingx_cfg(m), m),
     "coinbase": lambda m: (CoinbaseRest, coinbase_cfg(m), m),
+    "upbit": lambda m: (UpbitRest, upbit_cfg(m), m),
 }
 
 _EXCH_LABEL = {"binance": "Binance", "okx": "OKX", "mexc": "MEXC",
                "binanceus": "Binance.US", "bybit": "Bybit", "bitget": "Bitget",
-               "bingx": "BingX", "coinbase": "Coinbase"}
+               "bingx": "BingX", "coinbase": "Coinbase", "upbit": "Upbit"}
 
 
 def _make_client(exch, market):
@@ -2386,6 +2534,7 @@ ALL_MARKETS = [
     ("Bitget Spot",     run_bitget,    "spot",    "bitget"),
     ("BingX Futures",   run_bingx,     "futures", "bingx"),
     ("BingX Spot",      run_bingx,     "spot",    "bingx"),
+    ("Upbit Spot",      run_upbit,     "spot",    "upbit"),
 ]
 
 # «both» = исходные Binance/OKX/MEXC (обратная совместимость с прежним запуском).
@@ -2485,7 +2634,7 @@ def main():
     if not markets:
         print(f"Нет рынков под фильтр exchange={exch} market={mkt}.")
         print("Допустимо: --exchange all|both|binance|okx|mexc|binanceus|bybit|"
-              "bitget|bingx|coinbase, --market both|spot|futures")
+              "bitget|bingx|coinbase|upbit, --market both|spot|futures")
         print("(«both» = Binance/OKX/MEXC как раньше; «all» = все биржи.)")
         return
 
