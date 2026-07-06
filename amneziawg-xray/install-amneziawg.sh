@@ -36,6 +36,10 @@ done
 
 [ "$(id -u)" -eq 0 ] || { echo "Запустите от root (sudo)." >&2; exit 1; }
 
+# Общая генерация параметров обфускации AWG 2.0 (H-диапазоны, CPS I1, Jc/S).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SCRIPT_DIR}/awg-params.sh"
+
 # --- Константы схемы (должны совпадать с bridge/*.sh) ---
 AWG_IF="awg0"
 AWG_SUBNET="10.9.9.0/24"
@@ -109,34 +113,18 @@ log "Внешний интерфейс: ${WAN_IF} | Endpoint для клиент
 # ---------------------------------------------------------------------------
 # 3) Генерация ключей и параметров обфускации AmneziaWG 2.0
 # ---------------------------------------------------------------------------
-rand() { # rand MIN MAX (включительно)
-  local min=$1 max=$2 r
-  r=$(( ( (RANDOM<<15) | RANDOM ) % (max-min+1) + min ))
-  echo "$r"
-}
-
 if [ -f "$AWG_CONF" ]; then
   log "Найден существующий ${AWG_CONF} — не перезаписываю. Переиспользую его параметры."
 else
-  log "Генерирую ключи и параметры обфускации AmneziaWG 2.0"
+  log "Генерирую ключи и параметры обфускации AmneziaWG 2.0 (H-диапазоны + CPS-DNS)"
   umask 077
   mkdir -p "$AWG_CONF_DIR"
   SRV_PRIV="$(awg genkey)"
   SRV_PUB="$(echo "$SRV_PRIV" | awg pubkey)"
 
-  Jc=$(rand 3 8)
-  Jmin=$(rand 40 80)
-  Jmax=$(( Jmin + $(rand 40 120) ))
-  S1=$(rand 15 150)
-  S2=$(rand 15 150); while [ "$S2" -eq "$((S1+56))" ]; do S2=$(rand 15 150); done  # S1+56 != S2
-  S3=$(rand 0 64)
-  S4=$(rand 0 32)
-  # H1..H4 — четыре различных значения в безопасном диапазоне (< INT32_MAX).
-  H1=$(rand 100000 500000000)
-  H2=$(rand 500000001 1000000000)
-  H3=$(rand 1000000001 1500000000)
-  H4=$(rand 1500000001 2100000000)
-  I1="<r 128>"   # CPS AmneziaWG 2.0 (без I1 клиент падает в режим AWG 1.0)
+  awg_gen_jc_s          # -> Jc/Jmin/Jmax/S1..S4
+  awg_gen_h_ranges      # -> H1..H4 как диапазоны "A-B"
+  awg_gen_cps_i1        # -> I1 = крафтовый CPS-пакет (DNS-ответ)
 
   cat > "$AWG_CONF" <<EOF
 # AmneziaWG сервер awg0 — трафик клиентов уходит в Xray (tun xray0), БЕЗ NAT.
