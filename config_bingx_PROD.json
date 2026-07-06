@@ -1,0 +1,26 @@
+{
+    "name": "BingX (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи из .env (BINGX_API_KEY / BINGX_API_SECRET). Символ формата BTC-USDT. Perp + spot. Локацию движка BingX официально не публикует (всё за CloudFront) — определяйте замером public_latency.py. WS-размещения ордеров нет — замер только REST. В perp positionSide=LONG работает в hedge; для one-way поставьте \"position_side\": \"BOTH\".",
+
+    "base_url": "https://open-api.bingx.com",
+    "timeout_sec": 10,
+
+    "auto_price": true,
+    "price_offset_pct": 1.0,
+    "auto_size": true,
+
+    "futures": {
+        "symbol": "BTC-USDT",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.0001",
+        "position_side": "LONG"
+    },
+
+    "spot": {
+        "symbol": "BTC-USDT",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.0001"
+    }
+}

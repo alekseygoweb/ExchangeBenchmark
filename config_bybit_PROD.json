@@ -1,0 +1,27 @@
+{
+    "name": "Bybit (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи из .env (BYBIT_API_KEY / BYBIT_API_SECRET). v5 unified: spot + linear (USDT-perp). Матчинг-движок — AWS Singapore (ap-southeast-1, AZ apse1-az2/az3). Есть WS-торговля (ws_url). Для HEDGE-аккаунта (linear) добавьте в блок futures \"position_idx\": 1 (long), иначе ордер отклонится.",
+
+    "base_url": "https://api.bybit.com",
+    "ws_url": "wss://stream.bybit.com/v5/trade",
+    "recv_window": 5000,
+    "timeout_sec": 10,
+
+    "auto_price": true,
+    "price_offset_pct": 1.0,
+    "auto_size": true,
+
+    "futures": {
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.001"
+    },
+
+    "spot": {
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.0005"
+    }
+}

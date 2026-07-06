@@ -1,0 +1,28 @@
+{
+    "name": "Bitget (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи из .env (BITGET_API_KEY / BITGET_API_SECRET / BITGET_API_PASSPHRASE). v2 API: spot + mix(USDT-FUTURES). Матчинг-движок по независимым замерам — AWS Tokyo (ap-northeast-1). WS-размещения ордеров нет — замер только REST. Для HEDGE-режима (mix) добавьте в блок futures \"trade_side\": \"open\".",
+
+    "base_url": "https://api.bitget.com",
+    "timeout_sec": 10,
+
+    "auto_price": true,
+    "price_offset_pct": 1.0,
+    "auto_size": true,
+
+    "futures": {
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.001",
+        "product_type": "USDT-FUTURES",
+        "margin_mode": "crossed",
+        "margin_coin": "USDT"
+    },
+
+    "spot": {
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.0001"
+    }
+}

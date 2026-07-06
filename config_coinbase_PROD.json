@@ -1,0 +1,18 @@
+{
+    "name": "Coinbase Exchange (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи из .env (COINBASE_API_KEY / COINBASE_API_SECRET / COINBASE_API_PASSPHRASE) — типа 'Coinbase Exchange' (HMAC+passphrase, НЕ CDP/JWT). Только спот, котировка USD. Матчинг-движок — AWS us-east-1. Ордера post_only (никогда не берут ликвидность). WS-размещения нет (для скорости — FIX-шлюз), замер только REST.",
+
+    "base_url": "https://api.exchange.coinbase.com",
+    "timeout_sec": 10,
+
+    "auto_price": true,
+    "price_offset_pct": 1.0,
+    "auto_size": true,
+
+    "spot": {
+        "symbol": "BTC-USD",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.0001"
+    }
+}

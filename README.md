@@ -1,17 +1,76 @@
 # ExchangeBenchmark
 
-Замер задержки торговых операций на **Binance**, **OKX** и **MEXC**
-(фьючерсы и спот), по двум транспортам — **REST API** и **WebSocket**, в двух
+Замер задержки торговых операций на **Binance**, **OKX**, **MEXC**,
+**Binance.US**, **Bybit**, **Bitget**, **BingX** и **Coinbase** (фьючерсы и
+спот, где есть), по двум транспортам — **REST API** и **WebSocket**, в двух
 режимах — **обычный лимитный** ордер и **условный (trigger/algo)** ордер.
 
 - `latency_test.py` — цикл «разместить ордер → отменить ордер», считает задержку
   размещения, отмены и суммы (мс) по каждой бирже / рынку / транспорту.
+  Требует **боевых ключей** (размещает реальные ордера).
+- `public_latency.py` — **публичный** замер (без ключей и без ордеров): REST RTT,
+  WS-upgrade, подписка на канал, WS ping/pong RTT + резолв IP/rDNS с подсказкой
+  региона/CDN. Именно им выбирают, **куда ставить VPS** (см. ниже).
 - `socket_test.py` — отдельный замер времени открытия WebSocket-сокета
   (DNS + TCP + TLS + upgrade) и логина OKX.
+
+## Где находятся сервера бирж (куда ставить VPS)
+
+Матчинг-движки бирж разнесены по двум кластерам — США и Азия, поэтому одной
+локацией не покрыть всё. Данные: официальная документация + независимые замеры +
+резолв прямых (не-CDN) эндпоинтов.
+
+| Биржа | Провайдер / регион | Город | Достоверность |
+|---|---|---|---|
+| Coinbase Exchange (спот) | AWS **us-east-1** | Сев. Вирджиния | ✅ офиц. + DNS |
+| Binance.US | AWS **us-east-1** | Сев. Вирджиния | ✅ прямой DNS |
+| Bybit | AWS **ap-southeast-1** (AZ `apse1-az2/az3`) | Сингапур | ✅ офиц. FAQ |
+| MEXC | AWS **ap-northeast-1** | Токио | ⚠ замеры/доки |
+| Bitget | AWS **ap-northeast-1** | Токио | ⚠ замеры |
+| BingX | не публикуется (за CloudFront) | Азия? | ❌ только замер |
+| Binance global | AWS **ap-northeast-1** | Токио | ✅ офиц. |
+| OKX | AWS/собств. | Гонконг/Сингапур | ⚠ замеры |
+
+Практика: **два сервера — AWS us-east-1 (Coinbase, Binance.US) и AWS Tokyo
+ap-northeast-1 (Binance, MEXC, Bitget, BingX?)**, плюс, если критичен Bybit, —
+Сингапур `ap-southeast-1`. Пинг по публичному REST бесполезен (все API за CDN —
+меряет edge, а не движок); мерить нужно WS-подписку/ping и полный цикл ордера.
+Неопределённость по MEXC/Bitget/**BingX** закрывается прогоном `public_latency.py`
+с VPS в Токио/Сингапуре/us-east-1.
 
 > ⚠️ **Скрипт работает на БОЕВЫХ счетах (PROD, РЕАЛЬНЫЕ ДЕНЬГИ).**
 > Размещаются настоящие ордера и сразу отменяются. Они стоят далеко от рынка
 > (non-marketable), чтобы не исполниться, объём минимальный. Весь риск на вас.
+
+## Публичный замер задержки (без ключей) — `public_latency.py`
+
+Отвечает на вопрос «куда ставить сервер» без ключей и без ордеров (нулевой риск).
+Гоняйте с каждого кандидата-VPS (Токио / Сингапур / us-east-1) и сравнивайте.
+
+```bash
+pip install -r requirements.txt
+python3 public_latency.py                       # все биржи
+python3 public_latency.py --exchange bybit,mexc,bingx,bitget,coinbase,binanceus
+python3 public_latency.py --resolve-only         # только IP / rDNS / регион
+python3 public_latency.py --breakdown            # + DNS / TCP / TLS раздельно
+python3 public_latency.py --list                 # ключи бирж
+```
+
+Что меряется по публичным эндпоинтам (аутентификация не нужна):
+
+| Метрика | Что это |
+|---|---|
+| **REST RTT** | полный цикл GET к публичному эндпоинту (server time / ping) |
+| **WS-upgrade** | установка WebSocket-соединения (DNS+TCP+TLS+HTTP 101) |
+| **Подписка** | от `subscribe` до подтверждения/первого сообщения канала |
+| **Ping/pong RTT** | app-level `ping→pong` на прогретом сокете (где биржа поддерживает; иначе управляющий WS-ping RFC6455) |
+
+Плюс резолв IP + reverse-DNS с подсказкой региона/CDN. **Важно:** REST-эндпоинты
+бирж стоят за CDN (CloudFront/Cloudflare/Akamai), поэтому REST RTT и TCP/TLS часто
+меряют ближайший edge, а не движок. Для выбора региона ориентируйтесь на
+**Подписку** и **Ping/pong** — они идут до origin-шлюза биржи. Прямой (не-CDN)
+эндпоинт есть, например, у Coinbase (`ws-direct.exchange.coinbase.com` →
+реальный us-east-1) и Binance.US (`stream.binance.us` → us-east-1).
 
 ## Быстрый старт — одна команда на всё
 
@@ -92,7 +151,7 @@ LATENCY_CONFIRM=1 python3 latency_test.py --exchange binance --market spot --rep
 
 | Флаг | Назначение |
 |---|---|
-| `--exchange both\|binance\|okx\|mexc` | Какую биржу гонять (по умолчанию все) |
+| `--exchange all\|both\|binance\|okx\|mexc\|binanceus\|bybit\|bitget\|bingx\|coinbase` | Какую биржу гонять. `both` = Binance/OKX/MEXC (как раньше); `all` = все биржи; либо имя одной |
 | `--market both\|spot\|futures` | Какой рынок (по умолчанию оба) |
 | `--repeats N` | Число повторов цикла (перекрывает `LATENCY_REPEATS`) |
 | `--auto-price` | Авто-цена от рынка (по умолчанию включена в обычных конфигах) |
@@ -182,8 +241,11 @@ LATENCY_CONFIRM=1 python3 latency_test.py --conditional --exchange both --market
 
 ## Ограничения транспортов по биржам
 
-- **MEXC** — у биржи **нет WS-API размещения ордеров** (WS только маркет-дата /
-  user-data). Все замеры MEXC — по REST; WS-ячейки честно помечены ошибкой.
+- **MEXC / Bitget / BingX / Coinbase** — у этих бирж **нет WS-API размещения
+  ордеров** (WS только маркет-дата / user-data; у Coinbase быстрый путь — FIX).
+  Замер place/cancel — только REST; WS-ячейки честно помечены ошибкой.
+- **WS-торговля есть** у Binance, Binance.US, OKX (лимит) и **Bybit**
+  (`wss://stream.bybit.com/v5/trade`, авторизация вне таймера).
 - **Условные ордера** — только REST на всех биржах (см. выше).
 - **OKX rate-limit (`50011`)** — OKX режет частоту размещения и штрафует за низкий
   fill-ratio (а у бенчмарка он нулевой). Чтобы WS-прогон сразу после REST по

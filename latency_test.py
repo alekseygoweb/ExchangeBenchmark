@@ -99,6 +99,12 @@ CONFIG_OKX_CONDITIONAL = os.environ.get(
     "CONFIG_OKX_CONDITIONAL", "config_okx_PROD_conditional.json")
 CONFIG_MEXC_CONDITIONAL = os.environ.get(
     "CONFIG_MEXC_CONDITIONAL", "config_mexc_PROD_conditional.json")
+# Дополнительные биржи (обычный лимитный режим). Условного режима у них нет.
+CONFIG_BINANCEUS = os.environ.get("CONFIG_BINANCEUS", "config_binanceus_PROD.json")
+CONFIG_BYBIT = os.environ.get("CONFIG_BYBIT", "config_bybit_PROD.json")
+CONFIG_BITGET = os.environ.get("CONFIG_BITGET", "config_bitget_PROD.json")
+CONFIG_BINGX = os.environ.get("CONFIG_BINGX", "config_bingx_PROD.json")
+CONFIG_COINBASE = os.environ.get("CONFIG_COINBASE", "config_coinbase_PROD.json")
 
 
 def _require_env(name):
@@ -138,6 +144,33 @@ def okx_credentials():
 
 def mexc_credentials():
     return _require_env("MEXC_API_KEY"), _require_env("MEXC_API_SECRET")
+
+
+def binanceus_credentials():
+    key = os.environ.get("BINANCEUS_API_KEY")
+    secret = os.environ.get("BINANCEUS_API_SECRET")
+    if not key or not secret:
+        raise RuntimeError("нет ключей Binance.US: задайте "
+                           "BINANCEUS_API_KEY/BINANCEUS_API_SECRET в .env")
+    return key, secret
+
+
+def bybit_credentials():
+    return _require_env("BYBIT_API_KEY"), _require_env("BYBIT_API_SECRET")
+
+
+def bitget_credentials():
+    return (_require_env("BITGET_API_KEY"), _require_env("BITGET_API_SECRET"),
+            _require_env("BITGET_API_PASSPHRASE"))
+
+
+def bingx_credentials():
+    return _require_env("BINGX_API_KEY"), _require_env("BINGX_API_SECRET")
+
+
+def coinbase_credentials():
+    return (_require_env("COINBASE_API_KEY"), _require_env("COINBASE_API_SECRET"),
+            _require_env("COINBASE_API_PASSPHRASE"))
 
 
 def load_config(path):
@@ -850,6 +883,526 @@ class MexcRest:
 
 
 # =========================================================================== #
+#     Реестр наших ордеров (для бирж без клиентского id в списке открытых)     #
+# =========================================================================== #
+# Bybit/Bitget/BingX-фьючерсы отдают наш clientOid в списке открытых ордеров —
+# там reconcile фильтрует по префиксу "lt", как для Binance/OKX. Но Coinbase
+# (client_oid обязан быть UUID) и BingX-спот (нет клиентского id) так не
+# отфильтровать. Для них помним id размещённых ордеров в процессе и снимаем
+# только их — чужие не трогаем.
+_run_orders = {}
+
+
+def _remember(key, token):
+    _run_orders.setdefault(key, []).append(token)
+
+
+def _reconcile_registry(client, key):
+    """Снять оставшиеся наши ордера (по запомненным в этом прогоне id)."""
+    tokens = _run_orders.get(key, [])
+    cancelled = 0
+    for tok in tokens:
+        try:
+            client.cancel_order(tok)                 # уже отменённый → ошибка → не в счёт
+            cancelled += 1
+        except Exception:
+            pass
+    _run_orders[key] = []
+    return cancelled, 0, client.position_amt()
+
+
+# =========================================================================== #
+#                              Bybit (v5)                                     #
+# =========================================================================== #
+# Bybit v5 unified: один REST-хост api.bybit.com для спота и linear (USDT-perp).
+# Подпись: X-BAPI-SIGN = HMAC_SHA256(secret, ts + api_key + recv_window + payload),
+# где payload = query-строка (GET) либо тело JSON (POST). Матчинг-движок Bybit —
+# AWS Singapore (ap-southeast-1, AZ apse1-az2/az3). Есть и WS-торговля
+# (wss://stream.bybit.com/v5/trade) — реализована ниже.
+BYBIT_CATEGORY = {"spot": "spot", "futures": "linear"}
+
+
+def _bybit_side(cfg):
+    return "Buy" if str(cfg.get("side", "buy")).lower().startswith("b") else "Sell"
+
+
+class BybitRest:
+    def __init__(self, cfg, market):
+        self.cfg = cfg
+        self.market = market
+        self.category = BYBIT_CATEGORY[market]
+        self.base = cfg.get("base_url", "https://api.bybit.com").rstrip("/")
+        self.key = cfg["api_key"]
+        self.secret = cfg["api_secret"].encode()
+        self.recv = str(cfg.get("recv_window", 5000))
+        self.timeout = cfg.get("timeout_sec", 10)
+        self.symbol = cfg["symbol"]
+        self.session = requests.Session()
+
+    def _headers(self, ts, payload):
+        sign = hmac.new(self.secret, (ts + self.key + self.recv + payload).encode(),
+                        hashlib.sha256).hexdigest()
+        return {"X-BAPI-API-KEY": self.key, "X-BAPI-TIMESTAMP": ts,
+                "X-BAPI-RECV-WINDOW": self.recv, "X-BAPI-SIGN": sign,
+                "Content-Type": "application/json"}
+
+    def _post(self, path, body):
+        ts = str(now_ms())
+        body_str = json.dumps(body)
+        r = self.session.post(self.base + path, data=body_str,
+                              headers=self._headers(ts, body_str), timeout=self.timeout)
+        data = r.json()
+        if data.get("retCode") != 0:
+            raise RuntimeError(f"Bybit {path}: {data.get('retCode')} {data.get('retMsg')}")
+        return data.get("result") or {}
+
+    def _get(self, path, params):
+        ts = str(now_ms())
+        qs = urlencode(params)
+        r = self.session.get(self.base + path + ("?" + qs if qs else ""),
+                             headers=self._headers(ts, qs), timeout=self.timeout)
+        data = r.json()
+        if data.get("retCode") != 0:
+            raise RuntimeError(f"Bybit {path}: {data.get('retCode')} {data.get('retMsg')}")
+        return data.get("result") or {}
+
+    def _order_body(self, cl):
+        body = {"category": self.category, "symbol": self.symbol, "side": _bybit_side(self.cfg),
+                "orderType": "Limit", "qty": str(self.cfg["size"]),
+                "price": str(self.cfg["price"]), "timeInForce": "GTC", "orderLinkId": cl}
+        if self.cfg.get("position_idx") is not None:    # hedge-режим linear (1 long/2 short)
+            body["positionIdx"] = int(self.cfg["position_idx"])
+        return body
+
+    def place_order(self):
+        cl = gen_cl_id()
+        self._post("/v5/order/create", self._order_body(cl))
+        return cl
+
+    def cancel_order(self, cl):
+        self._post("/v5/order/cancel",
+                   {"category": self.category, "symbol": self.symbol, "orderLinkId": cl})
+
+    def available_usdt(self):
+        res = self._get("/v5/account/wallet-balance",
+                        {"accountType": "UNIFIED", "coin": "USDT"})
+        for acc in res.get("list", []):
+            for c in acc.get("coin", []):
+                if c.get("coin") == "USDT":
+                    return float(c.get("availableToWithdraw") or c.get("walletBalance") or 0)
+        return 0.0
+
+    def list_open(self):
+        res = self._get("/v5/order/realtime", {"category": self.category, "symbol": self.symbol})
+        return res.get("list", [])
+
+    def position_amt(self):
+        if self.category != "linear":
+            return 0.0
+        res = self._get("/v5/position/list", {"category": "linear", "symbol": self.symbol})
+        return sum(float(p.get("size", 0) or 0) * (1 if p.get("side") == "Buy" else -1)
+                   for p in res.get("list", []))
+
+    def reconcile(self):
+        ours = [o for o in self.list_open()
+                if str(o.get("orderLinkId", "")).startswith("lt")]
+        for o in ours:
+            try:
+                self.cancel_order(o["orderLinkId"])
+            except Exception:
+                pass
+        left = [o for o in self.list_open()
+                if str(o.get("orderLinkId", "")).startswith("lt")]
+        return len(ours), len(left), self.position_amt()
+
+
+class BybitWs:
+    """WS-торговля Bybit v5 (wss://stream.bybit.com/v5/trade). Соединение и
+    авторизация — ВНЕ таймера, как у Binance/OKX."""
+    def __init__(self, cfg, market):
+        self.cfg = cfg
+        self.market = market
+        self.category = BYBIT_CATEGORY[market]
+        self.url = cfg.get("ws_url", "wss://stream.bybit.com/v5/trade")
+        self.key = cfg["api_key"]
+        self.secret = cfg["api_secret"].encode()
+        self.recv = str(cfg.get("recv_window", 5000))
+        self.timeout = cfg.get("timeout_sec", 10)
+        self.symbol = cfg["symbol"]
+        self.ws = None
+
+    def connect(self):
+        self.ws = create_connection(self.url, timeout=self.timeout)
+        expires = now_ms() + 5000
+        sign = hmac.new(self.secret, f"GET/realtime{expires}".encode(),
+                        hashlib.sha256).hexdigest()
+        self.ws.send(json.dumps({"op": "auth", "args": [self.key, expires, sign]}))
+        while True:
+            m = json.loads(self.ws.recv())
+            if m.get("op") == "auth":
+                if m.get("retCode") == 0 or m.get("success") is True:
+                    return
+                raise RuntimeError(f"Bybit WS auth: {m}")
+
+    def close(self):
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+    def _call(self, op, arg):
+        req_id = uuid.uuid4().hex
+        ts = str(now_ms())
+        self.ws.send(json.dumps({
+            "reqId": req_id,
+            "header": {"X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": self.recv},
+            "op": op, "args": [arg]}))
+        while True:
+            m = json.loads(self.ws.recv())
+            if m.get("reqId") != req_id:
+                continue
+            if m.get("retCode") not in (0, None):
+                raise RuntimeError(f"Bybit WS {op}: {m.get('retCode')} {m.get('retMsg')}")
+            return m
+
+    def place_order(self):
+        cl = gen_cl_id()
+        arg = {"category": self.category, "symbol": self.symbol, "side": _bybit_side(self.cfg),
+               "orderType": "Limit", "qty": str(self.cfg["size"]),
+               "price": str(self.cfg["price"]), "timeInForce": "GTC", "orderLinkId": cl}
+        if self.cfg.get("position_idx") is not None:
+            arg["positionIdx"] = int(self.cfg["position_idx"])
+        self._call("order.create", arg)
+        return cl
+
+    def cancel_order(self, cl):
+        self._call("order.cancel",
+                   {"category": self.category, "symbol": self.symbol, "orderLinkId": cl})
+
+
+# =========================================================================== #
+#                              Bitget (v2)                                    #
+# =========================================================================== #
+# Подпись: ACCESS-SIGN = base64(HMAC_SHA256(secret, ts + METHOD + requestPath+qs + body)).
+# Нужен passphrase (как у OKX/Coinbase). Матчинг-движок Bitget по независимым
+# замерам — AWS Tokyo (ap-northeast-1). WS-размещения ордеров у Bitget нет —
+# замер только REST.
+BITGET_PRODUCT_TYPE = "USDT-FUTURES"
+
+
+class BitgetRest:
+    def __init__(self, cfg, market):
+        self.cfg = cfg
+        self.market = market
+        self.is_futures = market == "futures"
+        self.base = cfg.get("base_url", "https://api.bitget.com").rstrip("/")
+        self.key = cfg["api_key"]
+        self.secret = cfg["api_secret"].encode()
+        self.passphrase = cfg["passphrase"]
+        self.timeout = cfg.get("timeout_sec", 10)
+        self.symbol = cfg["symbol"]
+        self.product_type = cfg.get("product_type", BITGET_PRODUCT_TYPE)
+        self.margin_coin = cfg.get("margin_coin", "USDT")
+        self.session = requests.Session()
+
+    def _sign(self, ts, method, path_qs, body):
+        msg = (ts + method + path_qs + body).encode()
+        return base64.b64encode(hmac.new(self.secret, msg, hashlib.sha256).digest()).decode()
+
+    def _request(self, method, path, params=None, body=None):
+        ts = str(now_ms())
+        query = "?" + urlencode(params) if params else ""
+        body_str = json.dumps(body) if body else ""
+        sign = self._sign(ts, method, path + query, body_str)
+        headers = {"ACCESS-KEY": self.key, "ACCESS-SIGN": sign, "ACCESS-TIMESTAMP": ts,
+                   "ACCESS-PASSPHRASE": self.passphrase, "Content-Type": "application/json",
+                   "locale": "en-US"}
+        r = self.session.request(method, self.base + path + query,
+                                 data=body_str if body else None,
+                                 headers=headers, timeout=self.timeout)
+        data = r.json()
+        if str(data.get("code")) != "00000":
+            raise RuntimeError(f"Bitget {path}: {data.get('code')} {data.get('msg')}")
+        return data.get("data")
+
+    def place_order(self):
+        cl = gen_cl_id()
+        side = "buy" if str(self.cfg.get("side", "buy")).lower().startswith("b") else "sell"
+        if self.is_futures:
+            body = {"symbol": self.symbol, "productType": self.product_type,
+                    "marginMode": self.cfg.get("margin_mode", "crossed"),
+                    "marginCoin": self.margin_coin, "size": str(self.cfg["size"]),
+                    "price": str(self.cfg["price"]), "side": side,
+                    "orderType": "limit", "force": "gtc", "clientOid": cl}
+            if self.cfg.get("trade_side"):              # hedge-режим: open/close
+                body["tradeSide"] = self.cfg["trade_side"]
+            self._request("POST", "/api/v2/mix/order/place-order", body=body)
+        else:
+            self._request("POST", "/api/v2/spot/trade/place-order", body={
+                "symbol": self.symbol, "side": side, "orderType": "limit", "force": "gtc",
+                "price": str(self.cfg["price"]), "size": str(self.cfg["size"]), "clientOid": cl})
+        return cl
+
+    def cancel_order(self, cl):
+        if self.is_futures:
+            self._request("POST", "/api/v2/mix/order/cancel-order", body={
+                "symbol": self.symbol, "productType": self.product_type, "clientOid": cl})
+        else:
+            self._request("POST", "/api/v2/spot/trade/cancel-order", body={
+                "symbol": self.symbol, "clientOid": cl})
+
+    def available_usdt(self):
+        if self.is_futures:
+            d = self._request("GET", "/api/v2/mix/account/account", params={
+                "symbol": self.symbol, "productType": self.product_type,
+                "marginCoin": self.margin_coin})
+            if isinstance(d, list):
+                d = d[0] if d else {}
+            return float((d or {}).get("available", 0) or 0)
+        d = self._request("GET", "/api/v2/spot/account/assets", params={"coin": "USDT"})
+        for a in (d or []):
+            if a.get("coin") == "USDT":
+                return float(a.get("available", 0) or 0)
+        return 0.0
+
+    def list_open(self):
+        if self.is_futures:
+            d = self._request("GET", "/api/v2/mix/order/orders-pending", params={
+                "symbol": self.symbol, "productType": self.product_type})
+        else:
+            d = self._request("GET", "/api/v2/spot/trade/unfilled-orders",
+                              params={"symbol": self.symbol})
+        if isinstance(d, dict):
+            return d.get("entrustedList") or d.get("orderList") or []
+        return d or []
+
+    def position_amt(self):
+        if not self.is_futures:
+            return 0.0
+        try:
+            d = self._request("GET", "/api/v2/mix/position/single-position", params={
+                "symbol": self.symbol, "productType": self.product_type,
+                "marginCoin": self.margin_coin})
+            return sum(float(p.get("total", 0) or 0) * (1 if p.get("holdSide") == "long" else -1)
+                       for p in (d or []))
+        except Exception:
+            return 0.0
+
+    def reconcile(self):
+        try:
+            ours = [o for o in self.list_open()
+                    if str(o.get("clientOid", "")).startswith("lt")]
+        except Exception:
+            ours = []
+        for o in ours:
+            try:
+                self.cancel_order(o["clientOid"])
+            except Exception:
+                pass
+        try:
+            left = [o for o in self.list_open()
+                    if str(o.get("clientOid", "")).startswith("lt")]
+        except Exception:
+            left = []
+        return len(ours), len(left), self.position_amt()
+
+
+# =========================================================================== #
+#                              BingX                                          #
+# =========================================================================== #
+# Подпись: HMAC_SHA256(secret, отсортированная query-строка) hex, подпись
+# добавляется в query, заголовок X-BX-APIKEY. Символ формата BTC-USDT. Локацию
+# матчинг-движка BingX официально не публикует (всё за CloudFront) — определяйте
+# замером. WS-размещения ордеров нет — замер только REST.
+
+
+class BingxRest:
+    def __init__(self, cfg, market):
+        self.cfg = cfg
+        self.market = market
+        self.is_futures = market == "futures"
+        self.base = cfg.get("base_url", "https://open-api.bingx.com").rstrip("/")
+        self.key = cfg["api_key"]
+        self.secret = cfg["api_secret"].encode()
+        self.timeout = cfg.get("timeout_sec", 10)
+        self.symbol = cfg["symbol"]
+        self.session = requests.Session()
+        self.session.headers.update({"X-BX-APIKEY": self.key})
+
+    def _signed(self, method, path, params):
+        params = dict(params)
+        params["timestamp"] = now_ms()
+        qs = urlencode(sorted(params.items()))
+        sig = hmac.new(self.secret, qs.encode(), hashlib.sha256).hexdigest()
+        url = f"{self.base}{path}?{qs}&signature={sig}"
+        r = self.session.request(method, url, timeout=self.timeout)
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"BingX {r.status_code}: не-JSON {r.text[:160]!r}")
+        if data.get("code") not in (0, None):
+            raise RuntimeError(f"BingX {path}: {data.get('code')} {data.get('msg')}")
+        return data.get("data") or {}
+
+    def place_order(self):
+        cl = gen_cl_id()
+        side = "BUY" if str(self.cfg.get("side", "buy")).lower().startswith("b") else "SELL"
+        if self.is_futures:
+            data = self._signed("POST", "/openApi/swap/v2/trade/order", {
+                "symbol": self.symbol, "side": side,
+                "positionSide": self.cfg.get("position_side", "LONG"),
+                "type": "LIMIT", "price": self.cfg["price"],
+                "quantity": self.cfg["size"], "clientOrderID": cl})
+            order = data.get("order") if isinstance(data, dict) else None
+            oid = (order or {}).get("orderId")
+        else:
+            data = self._signed("POST", "/openApi/spot/v1/trade/order", {
+                "symbol": self.symbol, "side": side, "type": "LIMIT",
+                "price": self.cfg["price"], "quantity": self.cfg["size"]})
+            oid = data.get("orderId") if isinstance(data, dict) else None
+        token = {"cl": cl, "oid": oid}
+        if not self.is_futures:                         # спот: нет клиентского id в списке
+            _remember(("bingx", self.market), token)
+        return token
+
+    def cancel_order(self, ref):
+        oid = ref.get("oid") if isinstance(ref, dict) else ref
+        cl = ref.get("cl") if isinstance(ref, dict) else None
+        if self.is_futures:
+            params = {"symbol": self.symbol}
+            if cl:
+                params["clientOrderID"] = cl
+            elif oid:
+                params["orderId"] = oid
+            self._signed("DELETE", "/openApi/swap/v2/trade/order", params)
+        else:
+            if not oid:
+                raise RuntimeError("BingX spot: нет orderId для отмены")
+            self._signed("POST", "/openApi/spot/v1/trade/cancel",
+                         {"symbol": self.symbol, "orderId": oid})
+
+    def list_open(self):
+        if self.is_futures:
+            data = self._signed("GET", "/openApi/swap/v2/trade/openOrders",
+                                {"symbol": self.symbol})
+        else:
+            data = self._signed("GET", "/openApi/spot/v1/trade/openOrders", {})
+        return (data or {}).get("orders", []) if isinstance(data, dict) else []
+
+    def position_amt(self):
+        if not self.is_futures:
+            return 0.0
+        try:
+            data = self._signed("GET", "/openApi/swap/v2/user/positions",
+                                {"symbol": self.symbol})
+            pos = data if isinstance(data, list) else (data or {}).get("positions", [])
+            return sum(float(p.get("positionAmt", 0) or 0) for p in pos)
+        except Exception:
+            return 0.0
+
+    def reconcile(self):
+        if not self.is_futures:                         # спот → по реестру прогона
+            return _reconcile_registry(self, ("bingx", self.market))
+        try:
+            ours = [o for o in self.list_open()
+                    if str(o.get("clientOrderID", "")).startswith("lt")]
+        except Exception:
+            ours = []
+        for o in ours:
+            try:
+                self._signed("DELETE", "/openApi/swap/v2/trade/order",
+                             {"symbol": self.symbol, "orderId": o.get("orderId")})
+            except Exception:
+                pass
+        try:
+            left = [o for o in self.list_open()
+                    if str(o.get("clientOrderID", "")).startswith("lt")]
+        except Exception:
+            left = []
+        return len(ours), len(left), self.position_amt()
+
+
+# =========================================================================== #
+#                     Coinbase Exchange (спот)                                #
+# =========================================================================== #
+# Coinbase Exchange (бывш. Coinbase Pro), api.exchange.coinbase.com — тот самый
+# US Spot Exchange на AWS us-east-1. Подпись как у OKX: CB-ACCESS-SIGN =
+# base64(HMAC_SHA256(base64decode(secret), ts + method + path + body)),
+# заголовки CB-ACCESS-KEY/TIMESTAMP/PASSPHRASE. Нужны ключи типа
+# "Coinbase Exchange" (не CDP/JWT). Ордера post_only — никогда не берут
+# ликвидность (доп. защита от исполнения). WS-размещения нет (для скорости —
+# FIX-шлюз), замер только REST.
+COINBASE_EXCHANGE_BASE = "https://api.exchange.coinbase.com"
+
+
+class CoinbaseRest:
+    def __init__(self, cfg, market):
+        self.cfg = cfg
+        self.market = market
+        self.base = cfg.get("base_url", COINBASE_EXCHANGE_BASE).rstrip("/")
+        self.key = cfg["api_key"]
+        self.secret = cfg["api_secret"]
+        self.passphrase = cfg["passphrase"]
+        self.timeout = cfg.get("timeout_sec", 10)
+        self.product = cfg["symbol"]                    # BTC-USD
+        self.session = requests.Session()
+
+    def _request(self, method, path, body=None):
+        ts = str(time.time())
+        body_str = json.dumps(body) if body else ""
+        try:
+            secret = base64.b64decode(self.secret)
+        except Exception:
+            raise RuntimeError("Coinbase: secret должен быть base64 (ключ Coinbase Exchange)")
+        sign = base64.b64encode(
+            hmac.new(secret, (ts + method + path + body_str).encode(),
+                     hashlib.sha256).digest()).decode()
+        headers = {"CB-ACCESS-KEY": self.key, "CB-ACCESS-SIGN": sign,
+                   "CB-ACCESS-TIMESTAMP": ts, "CB-ACCESS-PASSPHRASE": self.passphrase,
+                   "Content-Type": "application/json"}
+        r = self.session.request(method, self.base + path,
+                                 data=body_str if body else None,
+                                 headers=headers, timeout=self.timeout)
+        try:
+            data = r.json()
+        except ValueError:
+            data = {"raw": r.text[:200]}
+        if r.status_code >= 400:
+            raise RuntimeError(f"Coinbase {r.status_code} {path}: {data}")
+        return data
+
+    def place_order(self):
+        cl = str(uuid.uuid4())                          # Coinbase требует UUID
+        data = self._request("POST", "/orders", {
+            "product_id": self.product,
+            "side": "buy" if str(self.cfg.get("side", "buy")).lower().startswith("b") else "sell",
+            "type": "limit", "price": str(self.cfg["price"]), "size": str(self.cfg["size"]),
+            "time_in_force": "GTC", "post_only": True, "client_oid": cl})
+        oid = data.get("id")
+        if not oid:
+            raise RuntimeError(f"ордер не размещён: {data}")
+        _remember(("coinbase", self.market), oid)
+        return oid
+
+    def cancel_order(self, oid):
+        self._request("DELETE", f"/orders/{oid}")
+
+    def available_usdt(self):
+        data = self._request("GET", "/accounts")
+        for a in (data if isinstance(data, list) else []):
+            if a.get("currency") in ("USD", "USDT", "USDC"):
+                return float(a.get("available", 0) or 0)
+        return 0.0
+
+    def position_amt(self):
+        return 0.0                                       # спот — позиций нет
+
+    def reconcile(self):
+        return _reconcile_registry(self, ("coinbase", self.market))
+
+
+# =========================================================================== #
 #               Авто-цена: безопасный неисполняемый лимит                     #
 # =========================================================================== #
 # Идея: вместо ручной подгонки "price" в конфиге считаем цену от текущего
@@ -1230,13 +1783,28 @@ def resolve_okx_pos_side(cfg):
 
 def server_time_ms(exch, base, is_futures, simulated, timeout):
     base = base.rstrip("/")
-    if exch == "binance":
+    if exch in ("binance", "binanceus"):
         path = "/fapi/v1/time" if is_futures else "/api/v3/time"
         d = _binance_public_get(base + path, None, timeout)
         return int(d["serverTime"])
     if exch == "mexc":                               # сверяем по споту (api.mexc.com)
         d = requests.get(MEXC_SPOT_BASE + "/api/v3/time", timeout=timeout).json()
         return int(d["serverTime"])
+    if exch == "bybit":
+        d = requests.get(base + "/v5/market/time", timeout=timeout).json()
+        res = d.get("result") or {}
+        if res.get("timeNano"):
+            return int(int(res["timeNano"]) // 1_000_000)
+        return int(float(res.get("timeSecond", d.get("time", 0))) * 1000)
+    if exch == "bitget":
+        d = requests.get(base + "/api/v2/public/time", timeout=timeout).json()
+        return int((d.get("data") or {}).get("serverTime"))
+    if exch == "bingx":
+        d = requests.get(base + "/openApi/swap/v2/server/time", timeout=timeout).json()
+        return int((d.get("data") or {}).get("serverTime"))
+    if exch == "coinbase":
+        d = requests.get(base + "/time", timeout=timeout).json()
+        return int(float(d["epoch"]) * 1000)
     headers = {"x-simulated-trading": "1"} if simulated else {}
     d = requests.get(base + "/api/v5/public/time", headers=headers, timeout=timeout).json()
     return int(d["data"][0]["ts"])
@@ -1254,8 +1822,10 @@ def time_sync_preflight(markets):
             continue
         seen.add(exch)
         try:
-            cfg = {"binance": binance_cfg, "okx": okx_cfg,
-                   "mexc": mexc_cfg}[exch](market)
+            cfg = {"binance": binance_cfg, "okx": okx_cfg, "mexc": mexc_cfg,
+                   "binanceus": binanceus_cfg, "bybit": bybit_cfg,
+                   "bitget": bitget_cfg, "bingx": bingx_cfg,
+                   "coinbase": coinbase_cfg}[exch](market)
             t0 = now_ms()
             srv = server_time_ms(exch, cfg.get("base_url", ""), market == "futures",
                                  cfg.get("simulated", False), cfg.get("timeout_sec", 10))
@@ -1476,18 +2046,323 @@ def run_mexc(market, transport):
     return measure(c.place_order, c.cancel_order)
 
 
+# =========================================================================== #
+#      Загрузчики конфигов и авто-цена/размер для дополнительных бирж          #
+# =========================================================================== #
+def _shared_cfg(full, keys):
+    return {k: full[k] for k in keys if k in full}
+
+
+_SHARED_KEYS = ("base_url", "ws_url", "recv_window", "timeout_sec",
+                "auto_price", "price_offset_pct", "auto_size")
+
+
+def binanceus_cfg(market):
+    full = load_config(CONFIG_BINANCEUS)
+    cfg = {**_shared_cfg(full, ("auto_price", "price_offset_pct", "auto_size")),
+           **full[market]}
+    cfg["api_key"], cfg["api_secret"] = binanceus_credentials()
+    return cfg
+
+
+def bybit_cfg(market):
+    full = load_config(CONFIG_BYBIT)
+    cfg = {**_shared_cfg(full, _SHARED_KEYS), **full[market]}
+    cfg["api_key"], cfg["api_secret"] = bybit_credentials()
+    return cfg
+
+
+def bitget_cfg(market):
+    full = load_config(CONFIG_BITGET)
+    cfg = {**_shared_cfg(full, _SHARED_KEYS), **full[market]}
+    cfg["api_key"], cfg["api_secret"], cfg["passphrase"] = bitget_credentials()
+    return cfg
+
+
+def bingx_cfg(market):
+    full = load_config(CONFIG_BINGX)
+    cfg = {**_shared_cfg(full, _SHARED_KEYS), **full[market]}
+    cfg["api_key"], cfg["api_secret"] = bingx_credentials()
+    return cfg
+
+
+def coinbase_cfg(market):
+    full = load_config(CONFIG_COINBASE)
+    cfg = {**_shared_cfg(full, _SHARED_KEYS), **full[market]}
+    cfg["api_key"], cfg["api_secret"], cfg["passphrase"] = coinbase_credentials()
+    return cfg
+
+
+# ---- Bybit ----
+def _bybit_instrument(cfg, market):
+    base = cfg.get("base_url", "https://api.bybit.com").rstrip("/")
+    r = requests.get(base + "/v5/market/instruments-info",
+                     params={"category": BYBIT_CATEGORY[market], "symbol": cfg["symbol"]},
+                     timeout=cfg.get("timeout_sec", 10)).json()
+    lst = (r.get("result") or {}).get("list") or []
+    if not lst:
+        raise RuntimeError(f"Bybit instruments-info: {r}")
+    return lst[0]
+
+
+def bybit_safe_price(cfg, market, offset):
+    base = cfg.get("base_url", "https://api.bybit.com").rstrip("/")
+    r = requests.get(base + "/v5/market/tickers",
+                     params={"category": BYBIT_CATEGORY[market], "symbol": cfg["symbol"]},
+                     timeout=cfg.get("timeout_sec", 10)).json()
+    lst = (r.get("result") or {}).get("list") or []
+    if not lst:
+        raise RuntimeError(f"Bybit tickers: {r}")
+    bid, ask = float(lst[0]["bid1Price"]), float(lst[0]["ask1Price"])
+    tick = _bybit_instrument(cfg, market)["priceFilter"]["tickSize"]
+    return _compute_price(cfg, bid, ask, tick, offset)
+
+
+def bybit_min_size(cfg, market):
+    d = _bybit_instrument(cfg, market)["lotSizeFilter"]
+    min_qty = d.get("minOrderQty", "0")
+    step = d.get("qtyStep") or d.get("basePrecision") or min_qty
+    min_notional = d.get("minNotionalValue") or d.get("minOrderAmt") or 0
+    return _min_qty_for_notional(float(cfg["price"]), min_qty, step, min_notional)
+
+
+# ---- Bitget ----
+def _bitget_symbol_info(cfg, market):
+    base = cfg.get("base_url", "https://api.bitget.com").rstrip("/")
+    sym = cfg["symbol"]
+    timeout = cfg.get("timeout_sec", 10)
+    if market == "futures":
+        r = requests.get(base + "/api/v2/mix/market/contracts",
+                         params={"productType": cfg.get("product_type", BITGET_PRODUCT_TYPE),
+                                 "symbol": sym}, timeout=timeout).json()
+    else:
+        r = requests.get(base + "/api/v2/spot/public/symbols",
+                         params={"symbol": sym}, timeout=timeout).json()
+    data = r.get("data") or []
+    d = next((x for x in data if x.get("symbol") == sym), data[0] if data else None)
+    if not d:
+        raise RuntimeError(f"Bitget symbol info: {r}")
+    return d
+
+
+def bitget_safe_price(cfg, market, offset):
+    base = cfg.get("base_url", "https://api.bitget.com").rstrip("/")
+    sym = cfg["symbol"]
+    timeout = cfg.get("timeout_sec", 10)
+    if market == "futures":
+        r = requests.get(base + "/api/v2/mix/market/ticker",
+                         params={"symbol": sym,
+                                 "productType": cfg.get("product_type", BITGET_PRODUCT_TYPE)},
+                         timeout=timeout).json()
+    else:
+        r = requests.get(base + "/api/v2/spot/market/tickers",
+                         params={"symbol": sym}, timeout=timeout).json()
+    data = r.get("data")
+    row = data[0] if isinstance(data, list) and data else data
+    if not row:
+        raise RuntimeError(f"Bitget ticker: {r}")
+    bid, ask = float(row["bidPr"]), float(row["askPr"])
+    info = _bitget_symbol_info(cfg, market)
+    if market == "futures":
+        place = int(info.get("pricePlace", 1))
+        end = Decimal(str(info.get("priceEndStep", 1)))
+        tick = str(end * (Decimal(10) ** -place))
+    else:
+        tick = str(Decimal(10) ** -int(info.get("pricePrecision", 1)))
+    return _compute_price(cfg, bid, ask, tick, offset)
+
+
+def bitget_min_size(cfg, market):
+    info = _bitget_symbol_info(cfg, market)
+    if market == "futures":
+        step = info.get("sizeMultiplier") or str(Decimal(10) ** -int(info.get("volumePlace", 0)))
+        return _okx_min_size(info.get("minTradeNum", "0"), str(step))
+    step = str(Decimal(10) ** -int(info.get("quantityPrecision", 6)))
+    return _min_qty_for_notional(float(cfg["price"]), info.get("minTradeAmount", "0"),
+                                 step, info.get("minTradeUSDT") or 0)
+
+
+# ---- BingX ----
+def _bingx_contract(cfg):
+    base = cfg.get("base_url", "https://open-api.bingx.com").rstrip("/")
+    r = requests.get(base + "/openApi/swap/v2/quote/contracts",
+                     timeout=cfg.get("timeout_sec", 10)).json()
+    d = next((x for x in (r.get("data") or []) if x.get("symbol") == cfg["symbol"]), None)
+    if not d:
+        raise RuntimeError(f"BingX contracts: символ {cfg['symbol']} не найден")
+    return d
+
+
+def _bingx_spot_symbol(cfg):
+    base = cfg.get("base_url", "https://open-api.bingx.com").rstrip("/")
+    r = requests.get(base + "/openApi/spot/v1/common/symbols",
+                     params={"symbol": cfg["symbol"]}, timeout=cfg.get("timeout_sec", 10)).json()
+    data = r.get("data") or {}
+    syms = data.get("symbols") if isinstance(data, dict) else data
+    d = next((x for x in (syms or []) if x.get("symbol") == cfg["symbol"]), None)
+    if not d:
+        raise RuntimeError(f"BingX symbols: {cfg['symbol']} не найден")
+    return d
+
+
+def bingx_safe_price(cfg, market, offset):
+    base = cfg.get("base_url", "https://open-api.bingx.com").rstrip("/")
+    timeout = cfg.get("timeout_sec", 10)
+    if market == "futures":
+        r = requests.get(base + "/openApi/swap/v2/quote/bookTicker",
+                         params={"symbol": cfg["symbol"]}, timeout=timeout).json()
+        d = r.get("data") or {}
+        row = d[0] if isinstance(d, list) and d else d
+        bid, ask = float(row["bidPrice"]), float(row["askPrice"])
+        info = _bingx_contract(cfg)
+        tick = info.get("tickSize") or str(Decimal(10) ** -int(info.get("pricePrecision", 1)))
+    else:
+        r = requests.get(base + "/openApi/spot/v1/ticker/bookTicker",
+                         params={"symbol": cfg["symbol"]}, timeout=timeout).json()
+        d = r.get("data")
+        row = d[0] if isinstance(d, list) and d else d
+        bid, ask = float(row["bidPrice"]), float(row["askPrice"])
+        info = _bingx_spot_symbol(cfg)
+        tick = info.get("tickSize") or str(Decimal(10) ** -int(info.get("pricePrecision", 1)))
+    return _compute_price(cfg, bid, ask, tick, offset)
+
+
+def bingx_min_size(cfg, market):
+    if market == "futures":
+        info = _bingx_contract(cfg)
+        min_q = info.get("tradeMinQuantity") or info.get("size") or "0"
+        step = info.get("size") or str(Decimal(10) ** -int(info.get("quantityPrecision", 3)))
+        return _min_qty_for_notional(float(cfg["price"]), min_q, str(step),
+                                     info.get("tradeMinUSDT") or 0)
+    info = _bingx_spot_symbol(cfg)
+    min_q = info.get("minQty") or info.get("minTradeQuantity") or "0"
+    step = info.get("stepSize") or str(Decimal(10) ** -int(info.get("quantityPrecision", 6)))
+    return _min_qty_for_notional(float(cfg["price"]), min_q, str(step),
+                                 info.get("minNotional") or 0)
+
+
+# ---- Coinbase ----
+def _coinbase_product(cfg):
+    base = cfg.get("base_url", COINBASE_EXCHANGE_BASE).rstrip("/")
+    return requests.get(base + f"/products/{cfg['symbol']}",
+                        timeout=cfg.get("timeout_sec", 10)).json()
+
+
+def coinbase_safe_price(cfg, offset):
+    base = cfg.get("base_url", COINBASE_EXCHANGE_BASE).rstrip("/")
+    tk = requests.get(base + f"/products/{cfg['symbol']}/ticker",
+                      timeout=cfg.get("timeout_sec", 10)).json()
+    bid, ask = float(tk["bid"]), float(tk["ask"])
+    tick = _coinbase_product(cfg).get("quote_increment", "0.01")
+    return _compute_price(cfg, bid, ask, tick, offset)
+
+
+def coinbase_min_size(cfg):
+    p = _coinbase_product(cfg)
+    step = p.get("base_increment", "0.00000001")
+    return _min_qty_for_notional(float(cfg["price"]), p.get("base_min_size") or step,
+                                 step, p.get("min_market_funds") or 0)
+
+
+# =========================================================================== #
+#                 Прогон дополнительных бирж (обычный лимит)                   #
+# =========================================================================== #
+def run_binanceus(market, transport):
+    cfg = binanceus_cfg(market)
+    if auto_price_on(cfg):
+        cfg["price"] = _auto_price(("Binance.US", market),
+                                   lambda: binance_safe_price(cfg, market, price_offset(cfg)))
+    if auto_size_on(cfg):
+        cfg["quantity"] = _auto_size(("Binance.US", market),
+                                     lambda: binance_min_order_size(cfg, market))
+    if transport == "API":
+        c = BinanceRest(cfg, market)
+        return measure(c.place_order, c.cancel_order)
+    return measure_ws(BinanceWs(cfg, market))
+
+
+def run_bybit(market, transport):
+    cfg = bybit_cfg(market)
+    if auto_price_on(cfg):
+        cfg["price"] = _auto_price(("Bybit", market),
+                                   lambda: bybit_safe_price(cfg, market, price_offset(cfg)))
+    if auto_size_on(cfg):
+        cfg["size"] = _auto_size(("Bybit", market), lambda: bybit_min_size(cfg, market))
+    if transport == "API":
+        c = BybitRest(cfg, market)
+        return measure(c.place_order, c.cancel_order)
+    return measure_ws(BybitWs(cfg, market))
+
+
+def run_bitget(market, transport):
+    cfg = bitget_cfg(market)
+    if auto_price_on(cfg):
+        cfg["price"] = _auto_price(("Bitget", market),
+                                   lambda: bitget_safe_price(cfg, market, price_offset(cfg)))
+    if auto_size_on(cfg):
+        cfg["size"] = _auto_size(("Bitget", market), lambda: bitget_min_size(cfg, market))
+    if transport != "API":
+        raise RuntimeError("Bitget: размещение ордеров только через REST "
+                           "(WS-API размещения у Bitget нет)")
+    c = BitgetRest(cfg, market)
+    return measure(c.place_order, c.cancel_order)
+
+
+def run_bingx(market, transport):
+    cfg = bingx_cfg(market)
+    if auto_price_on(cfg):
+        cfg["price"] = _auto_price(("BingX", market),
+                                   lambda: bingx_safe_price(cfg, market, price_offset(cfg)))
+    if auto_size_on(cfg):
+        cfg["size"] = _auto_size(("BingX", market), lambda: bingx_min_size(cfg, market))
+    if transport != "API":
+        raise RuntimeError("BingX: размещение ордеров только через REST "
+                           "(WS-API размещения у BingX нет)")
+    c = BingxRest(cfg, market)
+    return measure(c.place_order, c.cancel_order)
+
+
+def run_coinbase(market, transport):
+    cfg = coinbase_cfg(market)
+    if auto_price_on(cfg):
+        cfg["price"] = _auto_price(("Coinbase", market),
+                                   lambda: coinbase_safe_price(cfg, price_offset(cfg)))
+    if auto_size_on(cfg):
+        cfg["size"] = _auto_size(("Coinbase", market), lambda: coinbase_min_size(cfg))
+    if transport != "API":
+        raise RuntimeError("Coinbase: размещение ордеров только через REST "
+                           "(для скорости — FIX-шлюз; WS-API размещения нет)")
+    c = CoinbaseRest(cfg, market)
+    return measure(c.place_order, c.cancel_order)
+
+
+# Построение клиента для reconcile/preflight по имени биржи.
+_CFG_LOADERS = {
+    "binance": lambda m: (BinanceRest, binance_cfg(m), m),
+    "okx": lambda m: (OkxRest, okx_cfg(m), None),
+    "mexc": lambda m: (MexcRest, mexc_cfg(m), m),
+    "binanceus": lambda m: (BinanceRest, binanceus_cfg(m), m),
+    "bybit": lambda m: (BybitRest, bybit_cfg(m), m),
+    "bitget": lambda m: (BitgetRest, bitget_cfg(m), m),
+    "bingx": lambda m: (BingxRest, bingx_cfg(m), m),
+    "coinbase": lambda m: (CoinbaseRest, coinbase_cfg(m), m),
+}
+
+_EXCH_LABEL = {"binance": "Binance", "okx": "OKX", "mexc": "MEXC",
+               "binanceus": "Binance.US", "bybit": "Bybit", "bitget": "Bitget",
+               "bingx": "BingX", "coinbase": "Coinbase"}
+
+
+def _make_client(exch, market):
+    cls, cfg, m = _CFG_LOADERS[exch](market)
+    return cls(cfg, m) if m is not None else cls(cfg)
+
+
 def reconcile_market(exch, market):
     """Защитная зачистка после прогона: снимаем свои висячие ордера и
     проверяем позицию (на случай reject/таймаута/частичного исполнения)."""
-    if exch == "binance":
-        c = BinanceRest(binance_cfg(market), market)
-        label = f"Binance {market}"
-    elif exch == "okx":
-        c = OkxRest(okx_cfg(market))
-        label = f"OKX {market}"
-    else:
-        c = MexcRest(mexc_cfg(market), market)
-        label = f"MEXC {market}"
+    c = _make_client(exch, market)
+    label = f"{_EXCH_LABEL.get(exch, exch)} {market}"
     cancelled, left, pos = c.reconcile()
     note = f"снято наших={cancelled}, осталось={left}, позиция={pos:g}"
     if left or abs(pos) > 1e-12:
@@ -1497,18 +2372,36 @@ def reconcile_market(exch, market):
 
 
 ALL_MARKETS = [
-    ("Binance Futures", run_binance, "futures", "binance"),
-    ("Binance Spot",    run_binance, "spot",    "binance"),
-    ("OKX Futures",     run_okx,     "futures", "okx"),
-    ("OKX Spot",        run_okx,     "spot",    "okx"),
-    ("MEXC Futures",    run_mexc,    "futures", "mexc"),
-    ("MEXC Spot",       run_mexc,    "spot",    "mexc"),
+    ("Binance Futures", run_binance,   "futures", "binance"),
+    ("Binance Spot",    run_binance,   "spot",    "binance"),
+    ("OKX Futures",     run_okx,       "futures", "okx"),
+    ("OKX Spot",        run_okx,       "spot",    "okx"),
+    ("MEXC Futures",    run_mexc,      "futures", "mexc"),
+    ("MEXC Spot",       run_mexc,      "spot",    "mexc"),
+    ("Coinbase Spot",   run_coinbase,  "spot",    "coinbase"),
+    ("Binance.US Spot", run_binanceus, "spot",    "binanceus"),
+    ("Bybit Futures",   run_bybit,     "futures", "bybit"),
+    ("Bybit Spot",      run_bybit,     "spot",    "bybit"),
+    ("Bitget Futures",  run_bitget,    "futures", "bitget"),
+    ("Bitget Spot",     run_bitget,    "spot",    "bitget"),
+    ("BingX Futures",   run_bingx,     "futures", "bingx"),
+    ("BingX Spot",      run_bingx,     "spot",    "bingx"),
 ]
+
+# «both» = исходные Binance/OKX/MEXC (обратная совместимость с прежним запуском).
+# «all» = все биржи. Либо имя конкретной биржи (bybit, bitget, bingx, coinbase,
+# binanceus, binance, okx, mexc).
+LEGACY_EXCH = ("binance", "okx", "mexc")
 
 
 def select_markets(exch, mkt):
-    return [row for row in ALL_MARKETS
-            if exch in ("both", row[3]) and mkt in ("both", row[2])]
+    if exch == "both":
+        rows = [r for r in ALL_MARKETS if r[3] in LEGACY_EXCH]
+    elif exch == "all":
+        rows = list(ALL_MARKETS)
+    else:
+        rows = [r for r in ALL_MARKETS if r[3] == exch]
+    return [row for row in rows if mkt in ("both", row[2])]
 
 
 # =========================================================================== #
@@ -1591,7 +2484,9 @@ def main():
     markets = select_markets(exch, mkt)
     if not markets:
         print(f"Нет рынков под фильтр exchange={exch} market={mkt}.")
-        print("Допустимо: --exchange both|binance|okx|mexc, --market both|spot|futures")
+        print("Допустимо: --exchange all|both|binance|okx|mexc|binanceus|bybit|"
+              "bitget|bingx|coinbase, --market both|spot|futures")
+        print("(«both» = Binance/OKX/MEXC как раньше; «all» = все биржи.)")
         return
 
     confirm_live(skip_confirm)

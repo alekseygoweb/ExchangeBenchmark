@@ -1,0 +1,21 @@
+{
+    "name": "Binance.US (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи из .env (BINANCEUS_API_KEY / BINANCEUS_API_SECRET). API идентичен Binance global spot (подпись HMAC-SHA256, /api/v3/order). Только спот. Матчинг-движок — AWS us-east-1. Есть WS-API размещения (ws-api.binance.us).",
+
+    "auto_price": true,
+    "price_offset_pct": 1.0,
+    "auto_size": true,
+
+    "spot": {
+        "base_url": "https://api.binance.us",
+        "ws_url": "wss://ws-api.binance.us/ws-api/v3",
+
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "price": "20000",
+        "quantity": "0.0002",
+        "time_in_force": "GTC",
+        "recv_window": 5000,
+        "timeout_sec": 10
+    }
+}
