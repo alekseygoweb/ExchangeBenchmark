@@ -213,8 +213,9 @@ SPECS = [
           ws="wss://api.upbit.com/websocket/v1",
           sub=json.dumps([{"ticket": "lt-probe"},
                           {"type": "ticker", "codes": ["KRW-BTC"]}]),
-          ack=_ack_upbit, ping="PING", pong=_pong_upbit,
-          note="AWS Seoul (ap-northeast-2), прямой EC2 (без CDN); WS-кадры бинарные JSON"),
+          ack=_ack_upbit, ping="PING", pong=_pong_upbit, pace=0.25,
+          note="AWS Seoul (ap-northeast-2), прямой EC2 (без CDN); WS-кадры бинарные JSON. "
+               "pace=0.25 — жёсткий rate-limit (429)"),
 
     # --- Референс: биржи, уже поддержанные в latency_test.py ---
     _spec(key="binance", name="Binance global (spot)", market="spot",
@@ -230,7 +231,8 @@ SPECS = [
           ws="wss://ws.okx.com:8443/ws/v5/public",
           sub=json.dumps({"op": "subscribe",
                           "args": [{"channel": "tickers", "instId": "BTC-USDT-SWAP"}]}),
-          ack=_ack_okx, ping="ping", pong=_pong_text),
+          ack=_ack_okx, ping="ping", pong=_pong_text, pace=0.1,
+          note="AWS ap-east-1 (Гонконг); pace=0.1 — REST rate-limit 50011"),
 ]
 
 
@@ -300,6 +302,7 @@ def measure_rest(spec, n, timeout):
     """REST RTT: прогреваем сессию, затем n замеров GET (min/median)."""
     if requests is None:
         raise RuntimeError("нет requests")
+    pace = spec.get("pace", 0)
     s = requests.Session()
     s.headers.update({"User-Agent": UA})
     s.get(spec["rest"], timeout=timeout)          # прогрев (вне замера)
@@ -310,6 +313,8 @@ def measure_rest(spec, n, timeout):
         times.append((time.perf_counter() - t) * 1000.0)
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:80]}")
+        if pace:
+            time.sleep(pace)
     return _stat(times)
 
 
@@ -317,6 +322,7 @@ def measure_upgrade(spec, n, timeout):
     """WS-upgrade: n раз открыть и закрыть сокет (min≈прогретый, без cold DNS)."""
     if not WS_OK:
         raise RuntimeError("нет websocket-client")
+    pace = spec.get("pace", 0)
     times = []
     for i in range(n):
         t = time.perf_counter()
@@ -324,6 +330,8 @@ def measure_upgrade(spec, n, timeout):
                                header=[f"User-Agent: {UA}"])
         times.append((time.perf_counter() - t) * 1000.0)
         ws.close()
+        if pace:
+            time.sleep(pace)
     return _stat(times)
 
 
@@ -407,6 +415,8 @@ def measure_subscribe(spec, n, timeout):
                 ws.close()
             except Exception:
                 pass
+        if spec.get("pace"):
+            time.sleep(spec["pace"])
     if not times:
         raise last_err or RuntimeError("подписка не удалась")
     return _stat(times)
@@ -417,18 +427,14 @@ def measure_ping(spec, n, timeout):
     управляющий WS-ping (RFC6455)."""
     if not WS_OK:
         raise RuntimeError("нет websocket-client")
+    # Пингуем БЕЗ подписки: иначе поток данных канала копится в сокете и «прогрёб»
+    # этого бэклога раздувает замер pong (заметно на чатных каналах, напр. Upbit).
     ws = create_connection(spec["ws"], timeout=timeout,
                            header=[f"User-Agent: {UA}"])
     try:
-        # Подпишемся (вне таймера), чтобы быть «нормальным» активным клиентом.
-        try:
-            ws.send(spec["sub"])
-            _recv_until(ws, lambda o, x, k: k == "DATA" and spec["ack"](o, x),
-                        spec, time.perf_counter() + timeout)
-        except Exception:
-            pass
         app_ping = spec.get("ping")
         pong = spec.get("pong")
+        pace = spec.get("pace") or 0.03                 # мягкий интервал (вне таймера)
         times = []
         last_err = None
         for i in range(n):
@@ -446,7 +452,7 @@ def measure_ping(spec, n, timeout):
             except Exception as e:                      # напр. сервер закрыл сокет на спам
                 last_err = e
                 break
-            time.sleep(0.03)                            # мягкий интервал (вне таймера)
+            time.sleep(pace)
         if not times:
             raise last_err or RuntimeError("ping не удался")
         return _stat(times)
