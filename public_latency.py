@@ -147,10 +147,8 @@ SPECS = [
           ws="wss://stream.binance.us:9443/ws",
           sub=json.dumps({"method": "SUBSCRIBE",
                           "params": ["btcusdt@bookTicker"], "id": 1}),
-          ack=_ack_binance,
-          ping=json.dumps({"method": "LIST_SUBSCRIPTIONS", "id": 2}),
-          pong=_pong_binance,
-          note="ping — LIST_SUBSCRIPTIONS (app-level request RTT)"),
+          ack=_ack_binance, ping=None,
+          note="ping — управляющий WS-ping (RFC6455)"),
 
     _spec(key="bybit", name="Bybit (futures)", market="futures",
           rest="https://api.bybit.com/v5/market/time",
@@ -210,9 +208,7 @@ SPECS = [
           ws="wss://stream.binance.com:9443/ws",
           sub=json.dumps({"method": "SUBSCRIBE",
                           "params": ["btcusdt@bookTicker"], "id": 1}),
-          ack=_ack_binance,
-          ping=json.dumps({"method": "LIST_SUBSCRIPTIONS", "id": 2}),
-          pong=_pong_binance,
+          ack=_ack_binance, ping=None,
           note="AWS Tokyo (ap-northeast-1); из США REST даёт 451"),
 
     _spec(key="okx", name="OKX (futures)", market="futures",
@@ -266,6 +262,17 @@ def _stat(times):
     if not times:
         return None
     return min(times), statistics.median(times)
+
+
+def _oneline(s, limit=90):
+    """Схлопнуть многострочную ошибку в одну строку и распознать гео-блок."""
+    s = re.sub(r"\s+", " ", str(s)).strip()
+    low = s.lower()
+    if "451" in s or "unavailable from a restricted" in low:
+        return "гео-блок (HTTP 451, недоступно из этого региона)"
+    if "403" in s and ("cloudfront" in low or "block" in low or "country" in low):
+        return "гео-блок (HTTP 403, регион заблокирован биржей)"
+    return s if len(s) <= limit else s[:limit] + "…"
 
 
 def _fmt(pair):
@@ -359,22 +366,35 @@ def _recv_until(ws, pred, spec, deadline):
 
 
 def measure_subscribe(spec, n, timeout):
-    """Подписка: сокет открыт ВНЕ таймера, меряем только subscribe→ack."""
+    """Подписка: сокет открыт ВНЕ таймера, меряем только subscribe→ack.
+    Одиночный сбой соединения не рушит весь замер — берём успешные попытки."""
     if not WS_OK:
         raise RuntimeError("нет websocket-client")
     ack = spec["ack"]
     times = []
+    last_err = None
     for _ in range(n):
-        ws = create_connection(spec["ws"], timeout=timeout,
-                               header=[f"User-Agent: {UA}"])
+        try:
+            ws = create_connection(spec["ws"], timeout=timeout,
+                                   header=[f"User-Agent: {UA}"])
+        except Exception as e:
+            last_err = e
+            continue
         try:
             t = time.perf_counter()
             ws.send(spec["sub"])
             _recv_until(ws, lambda o, x, k: k == "DATA" and ack(o, x),
                         spec, time.perf_counter() + timeout)
             times.append((time.perf_counter() - t) * 1000.0)
+        except Exception as e:
+            last_err = e
         finally:
-            ws.close()
+            try:
+                ws.close()
+            except Exception:
+                pass
+    if not times:
+        raise last_err or RuntimeError("подписка не удалась")
     return _stat(times)
 
 
@@ -396,20 +416,31 @@ def measure_ping(spec, n, timeout):
         app_ping = spec.get("ping")
         pong = spec.get("pong")
         times = []
-        for _ in range(n):
+        last_err = None
+        for i in range(n):
             deadline = time.perf_counter() + timeout
             t = time.perf_counter()
-            if app_ping is not None:
-                ws.send(app_ping)
-                _recv_until(ws, lambda o, x, k: k == "DATA" and pong(o, x),
-                            spec, deadline)
-            else:
-                ws.ping(b"lt")
-                _recv_until(ws, lambda o, x, k: k == "PONG", spec, deadline)
-            times.append((time.perf_counter() - t) * 1000.0)
+            try:
+                if app_ping is not None:
+                    ws.send(app_ping)
+                    _recv_until(ws, lambda o, x, k: k == "DATA" and pong(o, x),
+                                spec, deadline)
+                else:
+                    ws.ping(b"lt")
+                    _recv_until(ws, lambda o, x, k: k == "PONG", spec, deadline)
+                times.append((time.perf_counter() - t) * 1000.0)
+            except Exception as e:                      # напр. сервер закрыл сокет на спам
+                last_err = e
+                break
+            time.sleep(0.03)                            # мягкий интервал (вне таймера)
+        if not times:
+            raise last_err or RuntimeError("ping не удался")
         return _stat(times)
     finally:
-        ws.close()
+        try:
+            ws.close()
+        except Exception:
+            pass
 
 
 # =========================================================================== #
@@ -513,9 +544,10 @@ def run_table(specs, reps, connects, timeout):
         note = spec.get("note") or hint
         print(f"{spec['name']:<24}{cells['rest']:>14}{cells['upg']:>14}"
               f"{cells['sub']:>14}{cells['ping']:>14}   {hint}")
-        errs = [f"{k[:-4]}: {v}" for k, v in cells.items() if k.endswith("_err")]
-        if errs:
-            print(f"{'':<24}  ошибки → " + "; ".join(e[:70] for e in errs))
+        errs = [f"{k[:-4]}: {_oneline(v)}" for k, v in cells.items()
+                if k.endswith("_err")]
+        for e in errs:
+            print(f"{'':<24}  ✗ {e}")
         if note and note != hint:
             print(f"{'':<24}  прим.: {note}")
     print("═" * 104)
