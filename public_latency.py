@@ -213,9 +213,10 @@ SPECS = [
           ws="wss://api.upbit.com/websocket/v1",
           sub=json.dumps([{"ticket": "lt-probe"},
                           {"type": "ticker", "codes": ["KRW-BTC"]}]),
-          ack=_ack_upbit, ping="PING", pong=_pong_upbit, pace=0.25,
+          ack=_ack_upbit, ping=None, pace=0.25,
           note="AWS Seoul (ap-northeast-2), прямой EC2 (без CDN); WS-кадры бинарные JSON. "
-               "pace=0.25 — жёсткий rate-limit (429)"),
+               "pace=0.25 — rate-limit (429); ping — управляющий RFC6455 "
+               "(на текст PING Upbit сразу не отвечает); ориентир — Подписка"),
 
     # --- Референс: биржи, уже поддержанные в latency_test.py ---
     _spec(key="binance", name="Binance global (spot)", market="spot",
