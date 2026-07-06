@@ -1,9 +1,0 @@
-# udev-правило: надёжно (пере)настраивать мост AmneziaWG->Xray, когда Xray
-# создаёт/пересоздаёт интерфейс xray0 (при старте и при каждом рестарте Xray).
-#
-# Ставится в /etc/udev/rules.d/99-awg-xray.rules
-#
-# Почему udev, а не systemd .path: inotify на sysfs (/sys/class/net/xray0)
-# работает ненадёжно и часто пропускает пересоздание интерфейса. Событие
-# udev "add" для SUBSYSTEM=net приходит стабильно.
-ACTION=="add", SUBSYSTEM=="net", KERNEL=="xray0", RUN+="/bin/systemctl --no-block restart awg-xray-bridge.service"
