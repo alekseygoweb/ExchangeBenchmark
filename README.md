@@ -1,9 +1,10 @@
 # ExchangeBenchmark
 
 Замер задержки торговых операций на **Binance**, **OKX**, **MEXC**,
-**Binance.US**, **Bybit**, **Bitget**, **BingX**, **Coinbase** и **Upbit**
-(фьючерсы и спот, где есть), по двум транспортам — **REST API** и **WebSocket**,
-в двух режимах — **обычный лимитный** ордер и **условный (trigger/algo)** ордер.
+**Binance.US**, **Bybit**, **Bitget**, **BingX**, **Coinbase**, **Upbit**,
+**Gate.io** и **Bithumb** (фьючерсы и спот, где есть), по двум транспортам —
+**REST API** и **WebSocket**, в двух режимах — **обычный лимитный** ордер и
+**условный (trigger/algo)** ордер.
 
 - `latency_test.py` — цикл «разместить ордер → отменить ордер», считает задержку
   размещения, отмены и суммы (мс) по каждой бирже / рынку / транспорту.
@@ -29,6 +30,8 @@
 | MEXC | AWS **ap-northeast-1** | Токио | ✅ замер (6 точек) |
 | Bitget | AWS **ap-northeast-1** | Токио | ✅ замер (6 точек) |
 | Upbit | AWS **ap-northeast-2** (прямой EC2, без CDN) | Сеул | ✅ прямой DNS |
+| Gate.io | AWS **ap-northeast-1** (прямой EC2) | Токио | ✅ прямой DNS |
+| Bithumb | AWS **ap-northeast-2** (REST прямой EC2, WS за Akamai) | Сеул | ✅ прямой DNS |
 | Binance global | AWS **ap-northeast-1** | Токио | ✅ офиц. |
 | OKX | AWS **ap-east-1** | Гонконг | ✅ замер (6 точек) |
 
@@ -158,7 +161,7 @@ LATENCY_CONFIRM=1 python3 latency_test.py --exchange binance --market spot --rep
 
 | Флаг | Назначение |
 |---|---|
-| `--exchange all\|both\|binance\|okx\|mexc\|binanceus\|bybit\|bitget\|bingx\|coinbase\|upbit` | Какую биржу гонять. `both` = Binance/OKX/MEXC (как раньше); `all` = все биржи; либо имя одной |
+| `--exchange all\|both\|binance\|okx\|mexc\|binanceus\|bybit\|bitget\|bingx\|coinbase\|upbit\|gate\|bithumb` | Какую биржу гонять. `both` = Binance/OKX/MEXC (как раньше); `all` = все биржи; либо имя одной |
 | `--market both\|spot\|futures` | Какой рынок (по умолчанию оба) |
 | `--repeats N` | Число повторов цикла (перекрывает `LATENCY_REPEATS`) |
 | `--auto-price` | Авто-цена от рынка (по умолчанию включена в обычных конфигах) |

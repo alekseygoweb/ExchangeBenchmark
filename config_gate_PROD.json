@@ -1,0 +1,26 @@
+{
+    "name": "Gate.io (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи из .env (GATE_API_KEY / GATE_API_SECRET). API v4, подпись HMAC-SHA512. Символ BTC_USDT. Матчинг-движок — AWS Tokyo (ap-northeast-1). Фьючерсный size — в КОНТРАКТАХ (целое). WS-размещение у Gate есть, но здесь замер только REST.",
+
+    "base_url": "https://api.gateio.ws",
+    "settle": "usdt",
+    "timeout_sec": 10,
+
+    "auto_price": true,
+    "price_offset_pct": 1.0,
+    "auto_size": true,
+
+    "futures": {
+        "symbol": "BTC_USDT",
+        "side": "buy",
+        "price": "20000",
+        "size": "1"
+    },
+
+    "spot": {
+        "symbol": "BTC_USDT",
+        "side": "buy",
+        "price": "20000",
+        "size": "0.0001"
+    }
+}

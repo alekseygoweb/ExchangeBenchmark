@@ -1,0 +1,19 @@
+{
+    "name": "Bithumb (PROD - РЕАЛЬНЫЕ ДЕНЬГИ)",
+    "_comment": "Ключи из .env (BITHUMB_API_KEY / BITHUMB_API_SECRET). Bithumb API 2.0 — Upbit-совместимый (JWT HS256, /v1/orders, market=KRW-BTC). Только спот, рынок KRW. Матчинг-движок — AWS Seoul (ap-northeast-2). Отмена по uuid. WS-размещения нет — замер только REST. Нужен верифицированный аккаунт с KRW-балансом.",
+
+    "base_url": "https://api.bithumb.com",
+    "timeout_sec": 10,
+
+    "auto_price": true,
+    "price_offset_pct": 1.0,
+    "auto_size": true,
+
+    "spot": {
+        "symbol": "KRW-BTC",
+        "side": "buy",
+        "price": "50000000",
+        "size": "0.0001",
+        "min_notional_krw": 5000
+    }
+}

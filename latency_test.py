@@ -106,6 +106,8 @@ CONFIG_BITGET = os.environ.get("CONFIG_BITGET", "config_bitget_PROD.json")
 CONFIG_BINGX = os.environ.get("CONFIG_BINGX", "config_bingx_PROD.json")
 CONFIG_COINBASE = os.environ.get("CONFIG_COINBASE", "config_coinbase_PROD.json")
 CONFIG_UPBIT = os.environ.get("CONFIG_UPBIT", "config_upbit_PROD.json")
+CONFIG_GATE = os.environ.get("CONFIG_GATE", "config_gate_PROD.json")
+CONFIG_BITHUMB = os.environ.get("CONFIG_BITHUMB", "config_bithumb_PROD.json")
 
 
 def _require_env(name):
@@ -176,6 +178,14 @@ def coinbase_credentials():
 
 def upbit_credentials():
     return _require_env("UPBIT_API_KEY"), _require_env("UPBIT_API_SECRET")
+
+
+def gate_credentials():
+    return _require_env("GATE_API_KEY"), _require_env("GATE_API_SECRET")
+
+
+def bithumb_credentials():
+    return _require_env("BITHUMB_API_KEY"), _require_env("BITHUMB_API_SECRET")
 
 
 def load_config(path):
@@ -1493,6 +1503,192 @@ class UpbitRest:
 
 
 # =========================================================================== #
+#                          Gate.io (API v4)                                   #
+# =========================================================================== #
+# Gate.io v4, api.gateio.ws — прямой EC2 в AWS Tokyo (ap-northeast-1). Подпись:
+# SIGN = HMAC_SHA512(secret, METHOD\nPATH\nQUERY\nHexSHA512(body)\nTimestamp),
+# заголовки KEY / Timestamp / SIGN. Клиентский id (text) обязан начинаться с "t-".
+# Фьючерсный size — в КОНТРАКТАХ (целое, знак = сторона: + long / - short).
+# WS-размещение у Gate есть, но здесь замер только REST.
+GATE_BASE = "https://api.gateio.ws"
+GATE_PREFIX = "/api/v4"
+
+
+class GateRest:
+    def __init__(self, cfg, market):
+        self.cfg = cfg
+        self.market = market
+        self.is_futures = market == "futures"
+        self.base = cfg.get("base_url", GATE_BASE).rstrip("/")
+        self.key = cfg["api_key"]
+        self.secret = cfg["api_secret"].encode()
+        self.timeout = cfg.get("timeout_sec", 10)
+        self.symbol = cfg["symbol"]                      # BTC_USDT
+        self.settle = cfg.get("settle", "usdt")
+        self.session = requests.Session()
+
+    def _request(self, method, path, query="", body=None):
+        body_str = json.dumps(body) if body is not None else ""
+        hashed = hashlib.sha512(body_str.encode()).hexdigest()
+        ts = str(int(time.time()))
+        sign_str = f"{method}\n{path}\n{query}\n{hashed}\n{ts}"
+        sign = hmac.new(self.secret, sign_str.encode(), hashlib.sha512).hexdigest()
+        headers = {"KEY": self.cfg["api_key"], "Timestamp": ts, "SIGN": sign,
+                   "Content-Type": "application/json", "Accept": "application/json"}
+        url = self.base + path + ("?" + query if query else "")
+        r = self.session.request(method, url,
+                                 data=body_str if body is not None else None,
+                                 headers=headers, timeout=self.timeout)
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"Gate {r.status_code} {path}: не-JSON {r.text[:160]!r}")
+        if r.status_code >= 400:
+            raise RuntimeError(f"Gate {path}: {data}")
+        return data
+
+    def place_order(self):
+        cl = "t-" + gen_cl_id()                          # Gate требует префикс "t-"
+        side = "buy" if str(self.cfg.get("side", "buy")).lower().startswith("b") else "sell"
+        if self.is_futures:
+            size = abs(int(float(self.cfg["size"])))
+            if side == "sell":
+                size = -size
+            data = self._request("POST", f"{GATE_PREFIX}/futures/{self.settle}/orders",
+                                  body={"contract": self.symbol, "size": size,
+                                        "price": str(self.cfg["price"]), "tif": "gtc",
+                                        "text": cl})
+        else:
+            data = self._request("POST", f"{GATE_PREFIX}/spot/orders",
+                                  body={"currency_pair": self.symbol, "type": "limit",
+                                        "account": "spot", "side": side,
+                                        "amount": str(self.cfg["size"]),
+                                        "price": str(self.cfg["price"]),
+                                        "time_in_force": "gtc", "text": cl})
+        oid = str(data.get("id") or "")
+        if not oid:
+            raise RuntimeError(f"Gate ордер не размещён: {data}")
+        return {"id": oid, "text": cl}
+
+    def cancel_order(self, ref):
+        oid = ref["id"] if isinstance(ref, dict) else str(ref)
+        if self.is_futures:
+            self._request("DELETE", f"{GATE_PREFIX}/futures/{self.settle}/orders/{oid}")
+        else:
+            self._request("DELETE", f"{GATE_PREFIX}/spot/orders/{oid}",
+                          query=f"currency_pair={self.symbol}")
+
+    def available_usdt(self):
+        if self.is_futures:
+            d = self._request("GET", f"{GATE_PREFIX}/futures/{self.settle}/accounts")
+            return float((d or {}).get("available", 0) or 0)
+        d = self._request("GET", f"{GATE_PREFIX}/spot/accounts", query="currency=USDT")
+        for a in (d if isinstance(d, list) else []):
+            if a.get("currency") == "USDT":
+                return float(a.get("available", 0) or 0)
+        return 0.0
+
+    def list_open(self):
+        if self.is_futures:
+            return self._request("GET", f"{GATE_PREFIX}/futures/{self.settle}/orders",
+                                 query=f"contract={self.symbol}&status=open")
+        return self._request("GET", f"{GATE_PREFIX}/spot/orders",
+                             query=f"currency_pair={self.symbol}&status=open")
+
+    def position_amt(self):
+        if not self.is_futures:
+            return 0.0
+        try:
+            d = self._request("GET", f"{GATE_PREFIX}/futures/{self.settle}/positions/{self.symbol}")
+            return float((d or {}).get("size", 0) or 0)
+        except Exception:
+            return 0.0
+
+    def reconcile(self):
+        try:
+            ours = [o for o in self.list_open()
+                    if str(o.get("text", "")).startswith("t-lt")]
+        except Exception:
+            ours = []
+        for o in ours:
+            try:
+                self.cancel_order({"id": str(o.get("id"))})
+            except Exception:
+                pass
+        try:
+            left = [o for o in self.list_open()
+                    if str(o.get("text", "")).startswith("t-lt")]
+        except Exception:
+            left = []
+        return len(ours), len(left), self.position_amt()
+
+
+# =========================================================================== #
+#                       Bithumb (API 2.0, спот KRW)                           #
+# =========================================================================== #
+# Bithumb 2.0 (api.bithumb.com) — Upbit-СОВМЕСТИМЫЙ API: JWT (HS256) через тот же
+# _upbit_jwt, эндпоинты /v1/orders, market=KRW-BTC, side bid/ask, ord_type=limit.
+# Матчинг-движок — AWS Seoul (ap-northeast-2), прямой EC2 (REST). Отмена по uuid.
+# WS-размещения нет — замер только REST.
+BITHUMB_BASE = "https://api.bithumb.com"
+
+
+class BithumbRest:
+    def __init__(self, cfg, market):
+        self.cfg = cfg
+        self.market = market
+        self.base = cfg.get("base_url", BITHUMB_BASE).rstrip("/")
+        self.key = cfg["api_key"]
+        self.secret = cfg["api_secret"]
+        self.timeout = cfg.get("timeout_sec", 10)
+        self.symbol = cfg["symbol"]                      # KRW-BTC
+        self.session = requests.Session()
+
+    def _send(self, method, path, params=None):
+        query = urlencode(params) if params else ""
+        url = self.base + path + ("?" + query if query else "")
+        headers = {"Authorization": "Bearer " + _upbit_jwt(self.key, self.secret, query)}
+        r = self.session.request(method, url, headers=headers, timeout=self.timeout)
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"Bithumb {r.status_code} {path}: не-JSON {r.text[:160]!r}")
+        if r.status_code >= 400 or (isinstance(data, dict) and data.get("error")):
+            raise RuntimeError(f"Bithumb {path}: {data}")
+        return data
+
+    def place_order(self):
+        data = self._send("POST", "/v1/orders", {
+            "market": self.symbol,
+            "side": "bid" if str(self.cfg.get("side", "buy")).lower().startswith("b") else "ask",
+            "ord_type": "limit",
+            "price": str(self.cfg["price"]),
+            "volume": str(self.cfg["size"]),
+        })
+        uid = data.get("uuid")
+        if not uid:
+            raise RuntimeError(f"Bithumb: нет uuid в ответе: {data}")
+        _remember(("bithumb", self.market), uid)         # отмена по uuid
+        return uid
+
+    def cancel_order(self, uid):
+        self._send("DELETE", "/v1/order", {"uuid": uid})
+
+    def available_usdt(self):                            # у Bithumb котировка KRW
+        data = self._send("GET", "/v1/accounts")
+        for a in (data if isinstance(data, list) else []):
+            if a.get("currency") == "KRW":
+                return float(a.get("balance", 0) or 0)
+        return 0.0
+
+    def position_amt(self):
+        return 0.0                                        # спот — позиций нет
+
+    def reconcile(self):
+        return _reconcile_registry(self, ("bithumb", self.market))
+
+
+# =========================================================================== #
 #               Авто-цена: безопасный неисполняемый лимит                     #
 # =========================================================================== #
 # Идея: вместо ручной подгонки "price" в конфиге считаем цену от текущего
@@ -1895,10 +2091,12 @@ def server_time_ms(exch, base, is_futures, simulated, timeout):
     if exch == "coinbase":
         d = requests.get(base + "/time", timeout=timeout).json()
         return int(float(d["epoch"]) * 1000)
-    if exch == "upbit":
-        # У Upbit нет публичного server-time; JWT использует nonce, не время —
-        # сверять часы не нужно.
-        raise RuntimeError("у Upbit нет server-time (JWT по nonce) — пропуск")
+    if exch == "gate":
+        d = requests.get(base + "/api/v4/spot/time", timeout=timeout).json()
+        return int(d["server_time"])
+    if exch in ("upbit", "bithumb"):
+        # Нет публичного server-time; JWT использует nonce, не время — не сверяем.
+        raise RuntimeError(f"у {exch} нет server-time (JWT по nonce) — пропуск")
     headers = {"x-simulated-trading": "1"} if simulated else {}
     d = requests.get(base + "/api/v5/public/time", headers=headers, timeout=timeout).json()
     return int(d["data"][0]["ts"])
@@ -1919,7 +2117,8 @@ def time_sync_preflight(markets):
             cfg = {"binance": binance_cfg, "okx": okx_cfg, "mexc": mexc_cfg,
                    "binanceus": binanceus_cfg, "bybit": bybit_cfg,
                    "bitget": bitget_cfg, "bingx": bingx_cfg,
-                   "coinbase": coinbase_cfg, "upbit": upbit_cfg}[exch](market)
+                   "coinbase": coinbase_cfg, "upbit": upbit_cfg,
+                   "gate": gate_cfg, "bithumb": bithumb_cfg}[exch](market)
             t0 = now_ms()
             srv = server_time_ms(exch, cfg.get("base_url", ""), market == "futures",
                                  cfg.get("simulated", False), cfg.get("timeout_sec", 10))
@@ -2194,6 +2393,20 @@ def upbit_cfg(market):
     return cfg
 
 
+def gate_cfg(market):
+    full = load_config(CONFIG_GATE)
+    cfg = {**_shared_cfg(full, _SHARED_KEYS + ("settle",)), **full[market]}
+    cfg["api_key"], cfg["api_secret"] = gate_credentials()
+    return cfg
+
+
+def bithumb_cfg(market):
+    full = load_config(CONFIG_BITHUMB)
+    cfg = {**_shared_cfg(full, _SHARED_KEYS), **full[market]}
+    cfg["api_key"], cfg["api_secret"] = bithumb_credentials()
+    return cfg
+
+
 # ---- Bybit ----
 def _bybit_instrument(cfg, market):
     base = cfg.get("base_url", "https://api.bybit.com").rstrip("/")
@@ -2390,11 +2603,49 @@ def upbit_safe_price(cfg, offset):
 
 
 def upbit_min_size(cfg):
-    """Минимальный ордер Upbit — 5000 KRW; объём = 5000/цена, округлённый вверх
-    к шагу объёма (8 знаков)."""
+    """Минимальный ордер Upbit/Bithumb (KRW-рынок): объём = min_KRW/цена,
+    округлённый вверх к шагу объёма (8 знаков). Bithumb 2.0 — Upbit-совместим,
+    та же логика (min_notional_krw задаётся в конфиге)."""
     min_krw = float(cfg.get("min_notional_krw", 5000))
     return _min_qty_for_notional(float(cfg["price"]), "0.00000001",
                                  "0.00000001", min_krw)
+
+
+# ---- Gate.io ----
+def gate_safe_price(cfg, market, offset):
+    base = cfg.get("base_url", GATE_BASE).rstrip("/")
+    sym = cfg["symbol"]
+    timeout = cfg.get("timeout_sec", 10)
+    settle = cfg.get("settle", "usdt")
+    if market == "futures":
+        ob = requests.get(base + f"/api/v4/futures/{settle}/order_book",
+                          params={"contract": sym, "limit": 1}, timeout=timeout).json()
+        bid, ask = float(ob["bids"][0]["p"]), float(ob["asks"][0]["p"])
+        c = requests.get(base + f"/api/v4/futures/{settle}/contracts/{sym}",
+                         timeout=timeout).json()
+        tick = c.get("order_price_round", "0.1")
+    else:
+        ob = requests.get(base + "/api/v4/spot/order_book",
+                          params={"currency_pair": sym, "limit": 1}, timeout=timeout).json()
+        bid, ask = float(ob["bids"][0][0]), float(ob["asks"][0][0])
+        cp = requests.get(base + f"/api/v4/spot/currency_pairs/{sym}", timeout=timeout).json()
+        tick = str(Decimal(10) ** -int(cp.get("precision", 2)))
+    return _compute_price(cfg, bid, ask, tick, offset)
+
+
+def gate_min_size(cfg, market):
+    base = cfg.get("base_url", GATE_BASE).rstrip("/")
+    sym = cfg["symbol"]
+    timeout = cfg.get("timeout_sec", 10)
+    settle = cfg.get("settle", "usdt")
+    if market == "futures":                              # размер в КОНТРАКТАХ (целое)
+        c = requests.get(base + f"/api/v4/futures/{settle}/contracts/{sym}",
+                         timeout=timeout).json()
+        return str(int(c.get("order_size_min", 1) or 1))
+    cp = requests.get(base + f"/api/v4/spot/currency_pairs/{sym}", timeout=timeout).json()
+    step = str(Decimal(10) ** -int(cp.get("amount_precision", 6)))
+    return _min_qty_for_notional(float(cfg["price"]), cp.get("min_base_amount") or step,
+                                 step, cp.get("min_quote_amount") or 0)
 
 
 # =========================================================================== #
@@ -2483,6 +2734,35 @@ def run_upbit(market, transport):
     return measure(c.place_order, c.cancel_order)
 
 
+def run_gate(market, transport):
+    cfg = gate_cfg(market)
+    if auto_price_on(cfg):
+        cfg["price"] = _auto_price(("Gate", market),
+                                   lambda: gate_safe_price(cfg, market, price_offset(cfg)))
+    if auto_size_on(cfg):
+        cfg["size"] = _auto_size(("Gate", market), lambda: gate_min_size(cfg, market))
+    if transport != "API":
+        raise RuntimeError("Gate: в этом бенчмарке размещение только через REST "
+                           "(WS-API у Gate есть, но здесь не реализован)")
+    c = GateRest(cfg, market)
+    return measure(c.place_order, c.cancel_order)
+
+
+def run_bithumb(market, transport):
+    cfg = bithumb_cfg(market)
+    # Bithumb 2.0 — Upbit-совместимый public API, поэтому авто-цена/размер как у Upbit.
+    if auto_price_on(cfg):
+        cfg["price"] = _auto_price(("Bithumb", market),
+                                   lambda: upbit_safe_price(cfg, price_offset(cfg)))
+    if auto_size_on(cfg):
+        cfg["size"] = _auto_size(("Bithumb", market), lambda: upbit_min_size(cfg))
+    if transport != "API":
+        raise RuntimeError("Bithumb: размещение ордеров только через REST "
+                           "(WS-API размещения нет)")
+    c = BithumbRest(cfg, market)
+    return measure(c.place_order, c.cancel_order)
+
+
 # Построение клиента для reconcile/preflight по имени биржи.
 _CFG_LOADERS = {
     "binance": lambda m: (BinanceRest, binance_cfg(m), m),
@@ -2494,11 +2774,14 @@ _CFG_LOADERS = {
     "bingx": lambda m: (BingxRest, bingx_cfg(m), m),
     "coinbase": lambda m: (CoinbaseRest, coinbase_cfg(m), m),
     "upbit": lambda m: (UpbitRest, upbit_cfg(m), m),
+    "gate": lambda m: (GateRest, gate_cfg(m), m),
+    "bithumb": lambda m: (BithumbRest, bithumb_cfg(m), m),
 }
 
 _EXCH_LABEL = {"binance": "Binance", "okx": "OKX", "mexc": "MEXC",
                "binanceus": "Binance.US", "bybit": "Bybit", "bitget": "Bitget",
-               "bingx": "BingX", "coinbase": "Coinbase", "upbit": "Upbit"}
+               "bingx": "BingX", "coinbase": "Coinbase", "upbit": "Upbit",
+               "gate": "Gate.io", "bithumb": "Bithumb"}
 
 
 def _make_client(exch, market):
@@ -2535,6 +2818,9 @@ ALL_MARKETS = [
     ("BingX Futures",   run_bingx,     "futures", "bingx"),
     ("BingX Spot",      run_bingx,     "spot",    "bingx"),
     ("Upbit Spot",      run_upbit,     "spot",    "upbit"),
+    ("Gate Futures",    run_gate,      "futures", "gate"),
+    ("Gate Spot",       run_gate,      "spot",    "gate"),
+    ("Bithumb Spot",    run_bithumb,   "spot",    "bithumb"),
 ]
 
 # «both» = исходные Binance/OKX/MEXC (обратная совместимость с прежним запуском).
@@ -2634,7 +2920,7 @@ def main():
     if not markets:
         print(f"Нет рынков под фильтр exchange={exch} market={mkt}.")
         print("Допустимо: --exchange all|both|binance|okx|mexc|binanceus|bybit|"
-              "bitget|bingx|coinbase|upbit, --market both|spot|futures")
+              "bitget|bingx|coinbase|upbit|gate|bithumb, --market both|spot|futures")
         print("(«both» = Binance/OKX/MEXC как раньше; «all» = все биржи.)")
         return
 

@@ -110,11 +110,14 @@ def _ack_bingx(o, t):        # ack {"code":0,...} или первый data-ка�
 def _ack_coinbase(o, t):     # {"type":"subscriptions",...}
     return isinstance(o, dict) and o.get("type") == "subscriptions"
 
-def _ack_upbit(o, t):        # Upbit не шлёт ack — сразу поток; ловим первый ticker
+def _ack_upbit(o, t):        # Upbit/Bithumb 2.0 не шлют ack — сразу поток; первый ticker
     return isinstance(o, dict) and (o.get("type") == "ticker" or o.get("code"))
 
 def _pong_upbit(o, t):       # ответ на "PING": {"status":"UP"}
     return isinstance(o, dict) and o.get("status") == "UP"
+
+def _ack_gate(o, t):         # {"event":"subscribe","result":{"status":"success"}}
+    return isinstance(o, dict) and o.get("event") == "subscribe" and not o.get("error")
 
 
 # =========================================================================== #
@@ -207,6 +210,31 @@ SPECS = [
           sub=json.dumps({"op": "subscribe", "args": [
               {"instType": "SPOT", "channel": "ticker", "instId": "BTCUSDT"}]}),
           ack=_ack_bitget, ping="ping", pong=_pong_text),
+
+    _spec(key="gate", name="Gate.io (spot)", market="spot",
+          rest="https://api.gateio.ws/api/v4/spot/time",
+          ws="wss://api.gateio.ws/ws/v4/",
+          sub=lambda: json.dumps({"time": int(time.time()), "channel": "spot.tickers",
+                                  "event": "subscribe", "payload": ["BTC_USDT"]}),
+          ack=_ack_gate, ping=None,
+          note="AWS Tokyo (ap-northeast-1), прямой EC2; ping — управляющий RFC6455"),
+
+    _spec(key="gate-futures", name="Gate.io (futures)", market="futures",
+          rest="https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT",
+          ws="wss://fx-ws.gateio.ws/v4/ws/usdt",
+          sub=lambda: json.dumps({"time": int(time.time()), "channel": "futures.tickers",
+                                  "event": "subscribe", "payload": ["BTC_USDT"]}),
+          ack=_ack_gate, ping=None,
+          note="AWS Tokyo (ap-northeast-1), прямой EC2"),
+
+    _spec(key="bithumb", name="Bithumb (spot, KRW)", market="spot",
+          rest="https://api.bithumb.com/v1/ticker?markets=KRW-BTC",
+          ws="wss://ws-api.bithumb.com/websocket/v1",
+          sub=json.dumps([{"ticket": "lt-probe"},
+                          {"type": "ticker", "codes": ["KRW-BTC"]}]),
+          ack=_ack_upbit, ping=None, no_ping=True, pace=0.1,
+          note="AWS Seoul (ap-northeast-2) — REST прямой EC2, WS за Akamai; "
+               "Upbit-совместимый API, бинарные JSON; ping «—» (см. Upbit) — ориентир Подписка"),
 
     _spec(key="upbit", name="Upbit (spot, KRW)", market="spot",
           rest="https://api.upbit.com/v1/ticker?markets=KRW-BTC",
@@ -404,8 +432,9 @@ def measure_subscribe(spec, n, timeout):
             last_err = e
             continue
         try:
+            sub_msg = spec["sub"]() if callable(spec["sub"]) else spec["sub"]
             t = time.perf_counter()
-            ws.send(spec["sub"])
+            ws.send(sub_msg)
             _recv_until(ws, lambda o, x, k: k == "DATA" and ack(o, x),
                         spec, time.perf_counter() + timeout)
             times.append((time.perf_counter() - t) * 1000.0)
